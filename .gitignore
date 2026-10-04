@@ -1,0 +1,8 @@
+# Local tests, scratch files, and watchdog runtime diagnostics.
+/temp/
+/.cache/
+/snapshots/
+/state.json
+/watchdog.jsonl*
+*.log
+/TestResults.xml
