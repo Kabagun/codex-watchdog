@@ -354,6 +354,157 @@ Describe 'Hidden scheduled-task launcher' {
     }
 }
 
+function New-EnhancedLauncherFixture {
+    param([Parameter(Mandatory)][string]$UserHome)
+    $root = Join-Path $UserHome '.agents\skills\better-codex'
+    $scripts = Join-Path $root 'scripts'
+    $null = New-Item -ItemType Directory -Path $scripts -Force
+    Set-Content -LiteralPath (Join-Path $root 'SKILL.md') -Value 'name: better-codex'
+    @'
+@{ arguments=@($args); script=$PSCommandPath } | ConvertTo-Json -Depth 3 |
+    Set-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'invoked.json') -Encoding utf8
+'@ | Set-Content -LiteralPath (Join-Path $scripts 'codex-custom.ps1')
+    return $root
+}
+
+Describe 'Enhanced desktop launch selection' {
+    BeforeEach {
+        $userHome = Join-Path $TestDrive ('профиль с пробелами ' + [guid]::NewGuid())
+        $null = New-Item -ItemType Directory -Path $userHome -Force
+        $package = [ordered]@{Found=$true;Aumid='OpenAI.Codex_fixture!App'}
+    }
+
+    It 'preserves native activation only when the skill is absent' {
+        Mock Invoke-CodexNativeActivation {}
+        $plan = Get-CodexDesktopLaunchPlan -Package $package -UserHome $userHome
+        $plan.Mode | Should Be 'Native'
+        $launch = Start-CodexDesktop -Package $package -UserHome $userHome
+        $launch.Mode | Should Be 'Native'
+        Assert-MockCalled Invoke-CodexNativeActivation -Times 1 -Exactly -Scope It
+    }
+
+    It 'launches the canonical installed skill in a real child without overriding preferences' {
+        Mock Invoke-CodexNativeActivation { throw 'Native activation must not bypass an installed skill.' }
+        $skillRoot = New-EnhancedLauncherFixture -UserHome $userHome
+        $preferences = Join-Path $userHome 'Programs\CodexWidth'
+        $null = New-Item -ItemType Directory -Path $preferences -Force
+        Set-Content -LiteralPath (Join-Path $preferences 'profile.json') -Value '{"widthRem":137}'
+        Set-Content -LiteralPath (Join-Path $preferences 'admin.json') -Value '{"enabled":false}'
+        $before = @((Get-FileHash -LiteralPath (Join-Path $preferences 'profile.json')).Hash,(Get-FileHash -LiteralPath (Join-Path $preferences 'admin.json')).Hash)
+        $launch = Start-CodexDesktop -Package $package -UserHome $userHome
+        $marker = Join-Path $skillRoot 'invoked.json'
+        $deadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
+        while (-not (Test-Path -LiteralPath $marker) -and [DateTimeOffset]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+        (Test-Path -LiteralPath $marker) | Should Be $true
+        $record = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+        $record.script | Should Be (Join-Path $skillRoot 'scripts\codex-custom.ps1')
+        @($record.arguments).Count | Should Be 0
+        $launch.Mode | Should Be 'Enhanced'
+        @((Get-FileHash -LiteralPath (Join-Path $preferences 'profile.json')).Hash,(Get-FileHash -LiteralPath (Join-Path $preferences 'admin.json')).Hash) | Should Be $before
+        Assert-MockCalled Invoke-CodexNativeActivation -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not fall back when an installed skill is incomplete or launch fails' {
+        Mock Invoke-CodexNativeActivation { throw 'Native fallback must not run.' }
+        $skillRoot = New-EnhancedLauncherFixture -UserHome $userHome
+        Remove-Item -LiteralPath (Join-Path $skillRoot 'scripts\codex-custom.ps1')
+        (Get-CodexDesktopLaunchPlan -Package $package -UserHome $userHome).Mode | Should Be 'Unavailable'
+        $failure = $null
+        try { Start-CodexDesktop -Package $package -UserHome $userHome } catch { $failure = $_ }
+        $failure.Exception.Message | Should Be 'The installed better-codex skill is incomplete.'
+        $null = New-EnhancedLauncherFixture -UserHome $userHome
+        Mock Start-Process { throw 'Fixture launch error' }
+        $failure = $null
+        try { Start-CodexDesktop -Package $package -UserHome $userHome } catch { $failure = $_ }
+        $failure.Exception.Message | Should Be 'Fixture launch error'
+        Assert-MockCalled Invoke-CodexNativeActivation -Times 0 -Exactly -Scope It
+    }
+}
+
+Describe 'Managed Startup launch routing' {
+    BeforeEach {
+        $config = Get-WatchdogConfig
+        $config.StartupDirectory = Join-Path $TestDrive ('Startup с пробелами ' + [guid]::NewGuid())
+        $config.UserHome = Join-Path $TestDrive ('fixture user ' + [guid]::NewGuid())
+    }
+
+    It 'creates and repairs only its owned real shortcut without launching it' {
+        $plan = Set-CodexStartupLauncher -Config $config -CheckOnly
+        (Test-Path -LiteralPath $config.StartupDirectory) | Should Be $false
+        $link = Set-CodexStartupLauncher -Config $config
+        $link.verified | Should Be $true
+        $link.arguments.EndsWith('"LaunchOnly"') | Should Be $true
+        $link.target | Should Be (Join-Path $env:SystemRoot 'System32\wscript.exe')
+        $before = (Get-FileHash -LiteralPath $link.path).Hash
+        (Set-CodexStartupLauncher -Config $config).needsChange | Should Be $false
+        (Get-FileHash -LiteralPath $link.path).Hash | Should Be $before
+        $movedRoot = Join-Path $TestDrive 'moved source'
+        $null = New-Item -ItemType Directory -Path $movedRoot
+        Copy-Item -LiteralPath $config.ScriptPath,$config.LauncherPath -Destination $movedRoot
+        $config.ScriptPath=Join-Path $movedRoot 'CodexWatchdog.ps1';$config.LauncherPath=Join-Path $movedRoot 'CodexWatchdogLauncher.vbs'
+        $repaired = Set-CodexStartupLauncher -Config $config
+        $repaired.verified | Should Be $true
+        $repaired.arguments.Contains($config.ScriptPath) | Should Be $true
+    }
+
+    It 'preserves a foreign Startup entry' {
+        $null=New-Item -ItemType Directory -Path $config.StartupDirectory -Force
+        $path=Join-Path $config.StartupDirectory 'Codex Enhanced.lnk'
+        $shell=New-Object -ComObject WScript.Shell
+        try{$link=$shell.CreateShortcut($path);$link.TargetPath=Join-Path $env:SystemRoot 'System32\notepad.exe';$link.Description='User shortcut';$link.Save();[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)}finally{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)}
+        $before=(Get-FileHash -LiteralPath $path).Hash
+        $failure = $null
+        try { Set-CodexStartupLauncher -Config $config } catch { $failure = $_ }
+        $failure.Exception.Message | Should Be "Refusing to overwrite an unrelated Startup entry: $path"
+        (Get-FileHash -LiteralPath $path).Hash | Should Be $before
+    }
+
+    It 'runs the hidden VBS launcher with default Check and explicit LaunchOnly on a fake script' {
+        $fakeScript=Join-Path $TestDrive 'fake launch target.ps1'
+        @'
+param([string]$Action,[switch]$Json)
+$Action | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'action.txt')
+'@ | Set-Content -LiteralPath $fakeScript
+        $pwsh=(Get-Command pwsh.exe -CommandType Application|Select-Object -First 1).Source
+        $wscript=Join-Path $env:SystemRoot 'System32\wscript.exe'
+        foreach($mode in @('Check','LaunchOnly')){
+            $arguments='//B //NoLogo "{0}" "{1}" "{2}"' -f $config.LauncherPath,$pwsh,$fakeScript
+            if($mode -eq 'LaunchOnly'){$arguments+=' "LaunchOnly"'}
+            $child=Start-Process -FilePath $wscript -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+            $child.ExitCode | Should Be 0
+            (Get-Content -LiteralPath (Join-Path $TestDrive 'action.txt') -Raw).Trim() | Should Be $mode
+        }
+    }
+
+    It 'plans ordinary startup independently of Remote and database recovery gates' {
+        $null=New-EnhancedLauncherFixture -UserHome $config.UserHome
+        Mock Get-WatchdogConfig { $config }
+        Mock Get-CodexPackageInfo { [ordered]@{Found=$true;Aumid='OpenAI.Codex_fixture!App'} }
+        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$true} }
+        Mock Get-CodexObservation { throw 'Startup must not query Remote/DB recovery health.' }
+        Mock Read-WatchdogState { throw 'Startup must not read recovery state.' }
+        Mock Start-CodexDesktop { throw 'WhatIf must not launch any application.' }
+        $result=Invoke-CodexWatchdogMain -RequestedAction LaunchOnly -AsJson -WhatIfMode | ConvertFrom-Json
+        $result.action | Should Be 'WouldLaunch'
+        $result.launch.Mode | Should Be 'Enhanced'
+        ($result.launch.Arguments -match '-Admin|-Width|-RuntimeDirectory') | Should Be $false
+        Assert-MockCalled Start-CodexDesktop -Times 0 -Exactly -Scope It
+    }
+
+    It 'keeps native fallback idempotent when the skill is removed and Codex is already running' {
+        Mock Get-WatchdogConfig { $config }
+        Mock Get-CodexPackageInfo { [ordered]@{Found=$true;Aumid='OpenAI.Codex_fixture!App'} }
+        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$true} }
+        Mock Get-CodexObservation { throw 'Startup must not query Remote/DB recovery health.' }
+        Mock Start-CodexDesktop { throw 'An existing native app must not be activated again.' }
+        $result=Invoke-CodexWatchdogMain -RequestedAction LaunchOnly -AsJson | ConvertFrom-Json
+        $result.action | Should Be 'None'
+        $result.reason | Should Be 'CodexAlreadyRunning'
+        $result.launch.Mode | Should Be 'Native'
+        Assert-MockCalled Start-CodexDesktop -Times 0 -Exactly -Scope It
+    }
+}
+
 Describe 'Remote transport and database safety' {
     BeforeEach {
         $config = Get-WatchdogConfig

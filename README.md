@@ -32,6 +32,9 @@ pwsh -NoProfile -File $watchdog -Action Status
 # Show what an automatic check would do, without changing anything.
 pwsh -NoProfile -File $watchdog -Action Check -WhatIf -Json
 
+# Inspect the ordinary logon launch route without launching Codex or querying Remote/SQLite.
+pwsh -NoProfile -File $watchdog -Action LaunchOnly -WhatIf -Json
+
 # Install or update the scheduled task.
 pwsh -NoProfile -File $watchdog -Action Install -Json
 
@@ -49,6 +52,35 @@ repeats every minute with `InteractiveToken`, `LeastPrivilege`, and
 runs through `wscript.exe` and `CodexWatchdogLauncher.vbs`, which launches
 PowerShell with window style `0`; routine checks therefore create no console
 window or taskbar flash.
+
+## Enhanced launch and existing autostart
+
+Every recovery resolves the current user's canonical
+`$HOME\.agents\skills\better-codex\scripts\codex-custom.ps1`. When the skill is
+installed, the watchdog calls its current wrapper through PATH PowerShell 7.
+It supplies no width, runtime or administrator option: normal Enhanced launch,
+saved preferences and future skill updates remain owned by better-codex.
+An incomplete skill or failed Enhanced launch is reported rather than silently
+bypassed. If the skill is absent, the existing Windows package activation path
+remains the fallback.
+
+`-Action LaunchOnly` shares that selector but does not use Remote enrollment,
+SQLite health or recovery state as a prerequisite for ordinary app startup.
+It can apply normal Enhanced settings to an existing app; when the skill is
+absent and native Codex is already running, it does nothing. This action never
+closes or force-stops an application. A launch request does not prove rendered
+width, icon appearance or any actual process privilege.
+
+`Set-CodexStartupLauncher` can explicitly create/read back one owned
+`Codex Enhanced.lnk` in the current user's Startup folder. Its hidden VBS action
+calls this same watchdog source with `LaunchOnly`, so removing the skill later
+still leaves a functional native fallback. The ordinary watchdog `Install`
+action does not create this app-start entry or enable disabled app autostart.
+When replacing an already enabled native package startup, first verify the
+managed link, then disable only that native startup entry. Leave disabled or
+absent native startup alone. Foreign Startup links are refused. The monitoring
+task and app-start intent are separate; uninstalling the monitoring task does
+not delete the source or change independently configured app startup.
 
 ## Recovery rules
 
@@ -83,9 +115,10 @@ statuses, and event types. It then:
    `app-server` executable. The latter must use either the legacy AppX resource
    path or a direct versioned path under `%LOCALAPPDATA%\OpenAI\Codex\bin`;
    unrelated `codex.exe` processes are excluded.
-3. Activates the package through Windows `IApplicationActivationManager` using
-   its dynamically discovered App User Model ID. Activation errors are returned
-   to the watchdog instead of silently accepting an `explorer.exe` launch.
+3. Requests normal Enhanced through the canonical installed skill when present.
+   Otherwise activates the package through Windows `IApplicationActivationManager`
+   using its dynamically discovered App User Model ID. Native activation errors
+   remain visible; no `explorer.exe` launch is used as a success substitute.
 4. Waits up to 60 seconds for both the desktop root and app-server.
 5. Rechecks both SQLite databases and the enabled Remote enrollment.
 

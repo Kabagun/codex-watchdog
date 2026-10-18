@@ -11,7 +11,7 @@ It never records prompt, response, credential, or enrollment-secret content.
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [ValidateSet('Check', 'Status', 'Restart', 'Install', 'Uninstall')]
+    [ValidateSet('Check', 'Status', 'Restart', 'LaunchOnly', 'Install', 'Uninstall')]
     [string]$Action = 'Check',
 
     [switch]$Json
@@ -43,6 +43,8 @@ function Get-WatchdogConfig {
         SnapshotRoot                  = Join-Path $dataRoot 'snapshots'
         ScriptPath                    = $script:WatchdogScriptPath
         LauncherPath                  = Join-Path $scriptRoot 'CodexWatchdogLauncher.vbs'
+        UserHome                      = [Environment]::GetFolderPath('UserProfile')
+        StartupDirectory              = [Environment]::GetFolderPath('Startup')
         PreDispatchFreezeMinutes      = 3
         ProgressStaleMinutes          = 60
         StaleConfirmationMinutes      = 5
@@ -1160,7 +1162,42 @@ function Get-CodexObservation {
     }
 }
 
-function Start-CodexDesktop {
+function Get-CodexDesktopLaunchPlan {
+    <#
+    .SYNOPSIS
+    Selects the current user's installed Enhanced skill, or native package activation when absent.
+    .DESCRIPTION
+    Resolves the canonical skill on every launch. It never overrides width, runtime, icons or
+    administrator options. An incomplete installed skill fails explicitly instead of bypassing it.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
+        [string]$UserHome = [Environment]::GetFolderPath('UserProfile')
+    )
+    if ($Package.Contains('Found') -and -not $Package.Found) {
+        return [ordered]@{ Mode='Unavailable'; CanLaunch=$false; LauncherPath=$null; Error='The Codex package is not installed.' }
+    }
+    if (-not [IO.Path]::IsPathFullyQualified($UserHome)) { throw 'The current user home must be an absolute path.' }
+    $skillRoot = Join-Path $UserHome '.agents\skills\better-codex'
+    $skillLauncher = Join-Path $skillRoot 'scripts\codex-custom.ps1'
+    if (Test-Path -LiteralPath $skillRoot) {
+        if (-not (Test-Path -LiteralPath (Join-Path $skillRoot 'SKILL.md') -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $skillLauncher -PathType Leaf)) {
+            return [ordered]@{ Mode='Unavailable'; CanLaunch=$false; LauncherPath=$skillLauncher; Error='The installed better-codex skill is incomplete.' }
+        }
+        $pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        return [ordered]@{
+            Mode='Enhanced'; CanLaunch=$true; LauncherPath=$skillLauncher; Executable=$pwsh.Source
+            Arguments=('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $skillLauncher)
+            WorkingDirectory=$skillRoot; Error=$null
+        }
+    }
+    $aumid = if ($Package.Contains('Aumid')) { [string]$Package.Aumid } else { '' }
+    return [ordered]@{ Mode='Native'; CanLaunch=[bool]$aumid; LauncherPath=$null; Aumid=$aumid; Error=if($aumid){$null}else{'The Codex App User Model ID could not be resolved.'} }
+}
+
+function Invoke-CodexNativeActivation {
+    <# .SYNOPSIS Activates the discovered package through Windows without an executable-path fallback. #>
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Package)
 
     if (-not $Package.Aumid) {
@@ -1202,6 +1239,85 @@ public static class CodexApplicationActivation {
     }
 
     [void][CodexApplicationActivation]::Activate($Package.Aumid)
+}
+
+function Start-CodexDesktop {
+    <# .SYNOPSIS Requests the selected launch without changing the skill's normal preferences. #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
+        [string]$UserHome = [Environment]::GetFolderPath('UserProfile'),
+        [System.Collections.IDictionary]$LaunchPlan
+    )
+    $plan = if ($LaunchPlan) { $LaunchPlan } else { Get-CodexDesktopLaunchPlan -Package $Package -UserHome $UserHome }
+    if (-not $plan.CanLaunch) { throw $plan.Error }
+    if ($plan.Mode -eq 'Enhanced') {
+        $launcher = Start-Process -FilePath $plan.Executable -ArgumentList $plan.Arguments -WorkingDirectory $plan.WorkingDirectory -WindowStyle Hidden -PassThru -ErrorAction Stop
+        return [ordered]@{ Mode='Enhanced'; LauncherPath=$plan.LauncherPath; LauncherProcessId=$launcher.Id }
+    }
+    Invoke-CodexNativeActivation -Package $Package
+    return [ordered]@{ Mode='Native'; LauncherPath=$null; LauncherProcessId=$null }
+}
+
+function Set-CodexStartupLauncher {
+    <#
+    .SYNOPSIS
+    Creates or repairs one explicitly requested, owned Startup link to the shared launch selector.
+    .DESCRIPTION
+    This does not enable/disable package startup or execute the link. Call only when preserving
+    an existing enabled startup intent. A GUI-subsystem launcher avoids a PowerShell flash.
+    CheckOnly never writes files. Foreign links and linked paths are refused.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config,[switch]$CheckOnly)
+    $startupRoot = [string]$Config.StartupDirectory
+    if (-not [IO.Path]::IsPathFullyQualified($startupRoot)) { throw 'The Startup directory must be absolute.' }
+    if (Test-Path -LiteralPath $startupRoot) {
+        $rootItem = Get-Item -LiteralPath $startupRoot -Force
+        if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'The Startup directory must be an ordinary directory.' }
+    }
+    foreach ($source in @($Config.ScriptPath,$Config.LauncherPath)) {
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Startup source is missing: $source" }
+    }
+    $pwsh = (Get-Command pwsh.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $target = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $path = Join-Path $startupRoot 'Codex Enhanced.lnk'
+    $description = 'Codex Watchdog managed startup v1'
+    $arguments = '//B //NoLogo "{0}" "{1}" "{2}" "LaunchOnly"' -f $Config.LauncherPath,$pwsh,$Config.ScriptPath
+    $workingDirectory = Split-Path -Parent $Config.ScriptPath
+    $existed = Test-Path -LiteralPath $path
+    $originalBytes = $null
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $null
+    try {
+        if ($existed) {
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Refusing a linked or non-file Startup entry.' }
+            $link = $shell.CreateShortcut($path)
+            if ($link.Description -cne $description -or $link.TargetPath -ine $target -or
+                $link.Arguments -notmatch '^//B //NoLogo "[^"]*CodexWatchdogLauncher\.vbs" "[^"]*pwsh\.exe" "[^"]*CodexWatchdog\.ps1" "LaunchOnly"$') {
+                throw "Refusing to overwrite an unrelated Startup entry: $path"
+            }
+            $originalBytes = [IO.File]::ReadAllBytes($path)
+        } else { $link = $shell.CreateShortcut($path) }
+        $needsChange = -not $existed -or $link.TargetPath -ine $target -or $link.Arguments -cne $arguments -or $link.WorkingDirectory -ine $workingDirectory
+        $result = [ordered]@{ path=$path;target=$target;arguments=$arguments;description=$description;workingDirectory=$workingDirectory;needsChange=[bool]$needsChange;verified=(-not $needsChange);created=$false;checkOnly=[bool]$CheckOnly }
+        if ($CheckOnly -or -not $needsChange) { return $result }
+        $null = New-Item -ItemType Directory -Path $startupRoot -Force
+        $link.TargetPath=$target;$link.Arguments=$arguments;$link.Description=$description;$link.WorkingDirectory=$workingDirectory;$link.WindowStyle=7
+        $link.Save()
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link);$link=$null
+        $link=$shell.CreateShortcut($path)
+        if ($link.TargetPath -ine $target -or $link.Arguments -cne $arguments -or $link.Description -cne $description -or $link.WorkingDirectory -ine $workingDirectory) { throw 'The managed Startup link failed readback verification.' }
+        $result.needsChange=$false;$result.verified=$true;$result.created=-not $existed
+        return $result
+    } catch {
+        if ($null -ne $originalBytes) { [IO.File]::WriteAllBytes($path,$originalBytes) }
+        elseif (-not $existed -and (Test-Path -LiteralPath $path -PathType Leaf)) { Remove-Item -LiteralPath $path -Force }
+        throw
+    } finally {
+        if ($link) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link) }
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    }
 }
 
 function Stop-CodexPackageProcesses {
@@ -1277,7 +1393,7 @@ function Invoke-CodexRecovery {
     if ($Mode -eq 'Restart') {
         Stop-CodexPackageProcesses -Package $Observation.Package -Config $Config
     }
-    Start-CodexDesktop -Package $Observation.Package
+    $launch = Start-CodexDesktop -Package $Observation.Package -UserHome $Config.UserHome
     $State.startupGraceUntilUtc = $Now.AddMinutes($Config.StartupGraceMinutes).ToString('o')
     $waitResult = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $Observation.Package -TimeoutSeconds $Config.RecoveryVerificationSeconds
     $verifiedPackage = $waitResult.Package
@@ -1305,6 +1421,7 @@ function Invoke-CodexRecovery {
         -ThreadIds $Decision.ThreadIds -ProcessIds $process.AllPackageProcessIds -PackageVersion $verifiedPackage.Version -Validation $recoveryValidation
     return [ordered]@{
         Attempted        = $true
+        LaunchMethod     = $launch.Mode
         Successful       = $successful
         Outcome          = $outcome
         PackageVersionBefore = $Observation.Package.Version
@@ -1484,6 +1601,7 @@ function ConvertTo-PublicResult {
         protectedByThreadIds  = @($Decision.ProtectedByThreadIds)
         validation            = $Decision.Validation
         recovery              = $Recovery
+        launch                = Get-CodexDesktopLaunchPlan -Package $Observation.Package
     }
 }
 
@@ -1524,6 +1642,22 @@ function Invoke-CodexWatchdogMain {
         }
         $removed = Uninstall-WatchdogScheduledTask -Config $config
         Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{ action = if ($removed) { 'Uninstalled' } else { 'NotInstalled' }; diagnosticsRetained = $true; dataRoot = $config.DataRoot })
+        return
+    }
+
+    if ($RequestedAction -eq 'LaunchOnly') {
+        # A logon launcher preserves ordinary app-start intent, independently of Remote health.
+        $package = Get-CodexPackageInfo -Config $config
+        $plan = Get-CodexDesktopLaunchPlan -Package $package -UserHome $config.UserHome
+        $process = Get-CodexProcessObservation -Package $package
+        if ($plan.Mode -eq 'Native' -and $process.DesktopPresent) {
+            Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{action='None';reason='CodexAlreadyRunning';launch=$plan})
+        } elseif ($WhatIfMode) {
+            Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{action='WouldLaunch';reason='LogonLaunchRequested';launch=$plan})
+        } else {
+            $launch = Start-CodexDesktop -Package $package -LaunchPlan $plan
+            Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{action='LaunchRequested';reason='LogonLaunchRequested';launch=$launch})
+        }
         return
     }
 

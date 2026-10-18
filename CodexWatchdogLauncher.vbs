@@ -5,7 +5,7 @@ Option Explicit
 Dim arguments
 Set arguments = WScript.Arguments
 
-If arguments.Count <> 2 Then
+If arguments.Count < 2 Or arguments.Count > 3 Then
     WScript.Quit 87
 End If
 
@@ -16,12 +16,19 @@ End Function
 Dim shell
 Dim command
 Dim exitCode
+Dim action
+
+action = "Check"
+If arguments.Count = 3 Then
+    If arguments(2) <> "LaunchOnly" Then WScript.Quit 87
+    action = arguments(2)
+End If
 
 Set shell = CreateObject("WScript.Shell")
 command = QuoteArgument(arguments(0)) _
     & " -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden" _
     & " -ExecutionPolicy Bypass -File " & QuoteArgument(arguments(1)) _
-    & " -Action Check -Json"
+    & " -Action " & action & " -Json"
 
 exitCode = shell.Run(command, 0, True)
 WScript.Quit exitCode
