@@ -89,6 +89,7 @@ not delete the source or change independently configured app startup.
 | Codex is healthy or idle | Do nothing |
 | Desktop and app-server are absent | Launch Codex, then allow five minutes of startup grace |
 | Desktop exists but app-server is absent | Restart after five minutes and three consecutive checks |
+| A live direct app-server child uses an unrecognized or unreadable executable path | Report a manual condition; do not close or restart Codex |
 | `task_started` has no dispatch/model/tool progress | Restart after three minutes if no healthy task would be interrupted |
 | A progressed task has no progress | Mark stale after 60 minutes and require five more unchanged minutes |
 | A tool call, user-input wait, or approval is outstanding | Protect the task indefinitely |
@@ -104,6 +105,24 @@ text inside prompts or responses cannot accidentally trigger a recovery.
 Rollouts from an older app-server process generation are excluded from active
 task decisions.
 
+The app-server path can be the stock package executable, a versioned executable
+under `%LOCALAPPDATA%\OpenAI\Codex\bin`, or the exact existing `codex.exe`
+selected by `CODEX_CLI_PATH`. Each observation rereads persisted User settings,
+then Machine settings, before falling back to the inherited process environment.
+This prevents a long-lived Task Scheduler environment from hiding a newly selected
+core. An invalid selected override is reported; it does not silently select an
+older value. Recognition still requires the current installed Codex main process's
+ancestry and the `app-server` command role, rather than an executable name alone.
+
+If an override changes while its previous direct app-server child is still alive,
+the old server is `Unknown`, not `Missing`. Automatic recovery pauses with
+`UnrecognizedAppServer`, clears the missing-server observation window, and exposes
+the owned child's PID/path for inspection. It never treats that path as trusted or
+force-stops it. The stop routine also refuses to close Codex while an unknown
+direct server exists. Unrelated CLI processes and nested agent tool servers are
+not recognized as the desktop server. A genuinely missing server retains the
+normal five-minute, three-check recovery rule.
+
 ## Recovery sequence and limits
 
 Before recovery, the watchdog records a redacted snapshot containing only
@@ -112,9 +131,9 @@ statuses, and event types. It then:
 
 1. Requests a normal close and waits up to 15 seconds.
 2. Force-stops only the current AppX `ChatGPT.exe` and its descended
-   `app-server` executable. The latter must use either the legacy AppX resource
-   path or a direct versioned path under `%LOCALAPPDATA%\OpenAI\Codex\bin`;
-   unrelated `codex.exe` processes are excluded.
+   `app-server` executable. The latter must use a stock/versioned path or the exact
+   valid configured `CODEX_CLI_PATH`; unrelated `codex.exe` processes are excluded.
+   Unknown live direct app-server children block the stop operation.
 3. Requests normal Enhanced through the canonical installed skill when present.
    Otherwise activates the package through Windows `IApplicationActivationManager`
    using its dynamically discovered App User Model ID. Native activation errors
@@ -134,6 +153,11 @@ Runtime files are stored under `%LOCALAPPDATA%\CodexWatchdog`:
 - `state.json` — counters, cooldowns, and task-event fingerprints.
 - `watchdog.jsonl` — redacted check/recovery outcomes, rotated at 5 MB.
 - `snapshots\` — the newest 50 redacted pre-recovery snapshots.
+
+Read-only `Status` and `Check -WhatIf -Json` report `appServerStatus` as
+`Recognized`, `Unknown` or `Missing`, the configured override's source/error,
+and unknown direct app-server PID/path evidence. `appServerPresent` counts only
+recognized servers; an `Unknown` server is not an automatic restart trigger.
 
 Recovery entries contain a `validation` object. The `started` entry records the
 failed trigger rule, including safe evidence such as task ID, event type,

@@ -243,6 +243,41 @@ function Write-DiagnosticSnapshot {
     }
 }
 
+function Get-CodexAppServerOverride {
+    <#
+    .SYNOPSIS
+    Resolves the current user's exact configured core path without relying on a stale task environment.
+    .DESCRIPTION
+    Persisted User settings override Machine settings; Process is a fallback when neither exists.
+    An invalid selected value is reported rather than silently falling back to an older core.
+    EnvironmentValues can supply a captured environment for read-only inspection or tests.
+    #>
+    param([System.Collections.IDictionary]$EnvironmentValues)
+
+    if (-not $PSBoundParameters.ContainsKey('EnvironmentValues')) {
+        $EnvironmentValues = [ordered]@{
+            User = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'User')
+            Machine = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Machine')
+            Process = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Process')
+        }
+    }
+    foreach ($source in @('User', 'Machine', 'Process')) {
+        $value = [string]$EnvironmentValues[$source]
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        try {
+            if (-not [IO.Path]::IsPathFullyQualified($value) -or [IO.Path]::GetFileName($value) -ine 'codex.exe') {
+                throw 'CODEX_CLI_PATH must be an absolute path to codex.exe.'
+            }
+            $path = [IO.Path]::GetFullPath($value)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'The configured codex.exe does not exist.' }
+            return [ordered]@{ Executable=$path; Source=$source; Error=$null }
+        } catch {
+            return [ordered]@{ Executable=''; Source=$source; Error=$_.Exception.Message }
+        }
+    }
+    return [ordered]@{ Executable=''; Source='None'; Error=$null }
+}
+
 function Get-CodexPackageInfo {
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
 
@@ -259,6 +294,7 @@ function Get-CodexPackageInfo {
             DesktopExecutable   = ''
             AppServerExecutable = ''
             AppServerBinRoot    = ''
+            AppServerOverride   = Get-CodexAppServerOverride
             Aumid               = ''
         }
     }
@@ -291,6 +327,7 @@ function Get-CodexPackageInfo {
         DesktopExecutable   = Join-Path ([string]$package.InstallLocation) 'app\ChatGPT.exe'
         AppServerExecutable = Join-Path ([string]$package.InstallLocation) 'app\resources\codex.exe'
         AppServerBinRoot    = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin' } else { '' }
+        AppServerOverride   = Get-CodexAppServerOverride
         Aumid               = if ($applicationId) { "$($package.PackageFamilyName)!$applicationId" } else { '' }
     }
 }
@@ -318,25 +355,24 @@ function Test-ProcessDescendsFrom {
 }
 
 function Test-CodexAppServerExecutablePath {
+    <# .SYNOPSIS Accepts only stock/versioned paths or the exact existing configured core executable. #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
         [Parameter(Mandatory)][string]$ExecutablePath
     )
 
-    if ($Package.AppServerExecutable -and $ExecutablePath -ieq $Package.AppServerExecutable) {
-        return $true
-    }
-
-    $binRoot = if ($Package.Contains('AppServerBinRoot')) { [string]$Package.AppServerBinRoot } else { '' }
-    if (-not $binRoot) {
-        return $false
-    }
-
     try {
+        if (-not [IO.Path]::IsPathFullyQualified($ExecutablePath)) { return $false }
         $candidatePath = [IO.Path]::GetFullPath($ExecutablePath)
         if ([IO.Path]::GetFileName($candidatePath) -ine 'codex.exe') {
             return $false
         }
+        if ($Package.AppServerExecutable -and $candidatePath -ieq [IO.Path]::GetFullPath($Package.AppServerExecutable)) { return $true }
+        if ($Package.Contains('AppServerOverride') -and $Package.AppServerOverride.Executable -and
+            $candidatePath -ieq $Package.AppServerOverride.Executable -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) { return $true }
+
+        $binRoot = if ($Package.Contains('AppServerBinRoot')) { [string]$Package.AppServerBinRoot } else { '' }
+        if (-not $binRoot) { return $false }
 
         $versionDirectory = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName($candidatePath))
         if (-not $versionDirectory.Name -or $null -eq $versionDirectory.Parent) {
@@ -353,6 +389,7 @@ function Test-CodexAppServerExecutablePath {
 }
 
 function Get-CodexProcessObservation {
+    <# .SYNOPSIS Identifies recognized app servers and fails safely around unknown direct app-server children. #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
         [object[]]$Processes
@@ -362,6 +399,9 @@ function Get-CodexProcessObservation {
         return [ordered]@{
             DesktopPresent      = $false
             AppServerPresent    = $false
+            AppServerStatus     = 'Missing'
+            UnknownAppServerProcessIds = @()
+            UnknownAppServerExecutables = @()
             RootProcessIds      = @()
             AppServerProcessIds = @()
             AllPackageProcessIds = @()
@@ -387,15 +427,23 @@ function Get-CodexProcessObservation {
     })
     $rootIds = @($rootProcesses | ForEach-Object { [int]$_.ProcessId })
 
-    $appServerCandidates = @($Processes | Where-Object {
+    $appServerRoleProcesses = @($Processes | Where-Object {
         $_.Name -ieq 'codex.exe' -and
-        $_.ExecutablePath -and (Test-CodexAppServerExecutablePath -Package $Package -ExecutablePath $_.ExecutablePath) -and
         $_.CommandLine -match '(?i)(?:^|\s)app-server(?:\s|$)'
     })
+    $appServerCandidates = @($appServerRoleProcesses | Where-Object {
+        $_.ExecutablePath -and (Test-CodexAppServerExecutablePath -Package $Package -ExecutablePath $_.ExecutablePath)
+    })
     $appServers = @($appServerCandidates | Where-Object {
-        Test-ProcessDescendsFrom -ProcessId ([int]$_.ParentProcessId) -AncestorIds $rootIds -ProcessById $processById
+        $rootIds.Count -gt 0 -and (Test-ProcessDescendsFrom -ProcessId ([int]$_.ParentProcessId) -AncestorIds $rootIds -ProcessById $processById)
     })
     $appServerIds = @($appServers | ForEach-Object { [int]$_.ProcessId })
+    # A changed override or unreadable executable is uncertainty, not a missing server.
+    # Only direct children of the exact installed main process receive this protection;
+    # unrelated CLI servers and nested agent tool invocations do not.
+    $unknownAppServers = @($appServerRoleProcesses | Where-Object {
+        [int]$_.ParentProcessId -in $rootIds -and [int]$_.ProcessId -notin $appServerIds
+    })
 
     $allPackageIds = @($Processes | Where-Object {
         $_.ExecutablePath -and (
@@ -416,6 +464,9 @@ function Get-CodexProcessObservation {
     return [ordered]@{
         DesktopPresent       = $rootIds.Count -gt 0
         AppServerPresent     = $appServers.Count -gt 0
+        AppServerStatus      = if ($unknownAppServers.Count -gt 0) { 'Unknown' } elseif ($appServers.Count -gt 0) { 'Recognized' } else { 'Missing' }
+        UnknownAppServerProcessIds = @($unknownAppServers | ForEach-Object { [int]$_.ProcessId })
+        UnknownAppServerExecutables = @($unknownAppServers | ForEach-Object { [string]$_.ExecutablePath })
         RootProcessIds       = $rootIds
         AppServerProcessIds  = $appServerIds
         AllPackageProcessIds = $allPackageIds
@@ -968,6 +1019,11 @@ function Get-TriggerValidationReport {
                 requiredConsecutiveChecks = $Config.AppServerMissingChecks
             })
         }
+        'UnrecognizedAppServer' {
+            $checks += New-ValidationCheck -Name 'AppServerExecutableRecognized' -Status 'failed' -Expected 'A recognized app-server executable' -Observed $Observation.Process.UnknownAppServerExecutables -Details ([ordered]@{
+                processIds = @($Observation.Process.UnknownAppServerProcessIds)
+            })
+        }
         'PreDispatchLifecycleFreeze' {
             foreach ($thread in @($Observation.Threads | Where-Object { $Decision.ThreadIds -contains $_.ThreadId })) {
                 $started = ConvertTo-UtcDateTimeOffset $thread.TaskStartedUtc
@@ -1032,6 +1088,9 @@ function Get-RecoveryValidationReport {
         (New-ValidationCheck -Name 'LogsDatabaseIntegrity' -Status $(if ($Integrity.Logs -eq 'ok') { 'passed' } else { 'failed' }) -Expected 'ok' -Observed $Integrity.Logs)
         (New-ValidationCheck -Name 'RemoteEnrollmentEnabled' -Status $(if ($Enrollment.Status -eq 'Enabled') { 'passed' } else { 'failed' }) -Expected 'Enabled' -Observed $Enrollment.Status -Details ([ordered]@{ enabledCount = $Enrollment.EnabledCount }))
     )
+    if ($Process.Contains('AppServerStatus') -and $Process.AppServerStatus -eq 'Unknown') {
+        $checks += New-ValidationCheck -Name 'AppServerExecutableRecognized' -Status 'failed' -Expected 'A recognized app-server executable' -Observed $Process.UnknownAppServerExecutables
+    }
     return [ordered]@{
         phase                = 'postRecovery'
         packageVersionBefore = $BeforePackage.Version
@@ -1082,6 +1141,11 @@ function Get-WatchdogDecision {
     }
 
     $State.startupGraceUntilUtc = $null
+    if ($Observation.Process.Contains('AppServerStatus') -and $Observation.Process.AppServerStatus -eq 'Unknown') {
+        $State.appServerMissingSinceUtc = $null
+        $State.appServerMissingChecks = 0
+        return New-WatchdogDecision -Action 'Manual' -Reason 'UnrecognizedAppServer'
+    }
     if (-not $Observation.Process.AppServerPresent) {
         if (-not $State.appServerMissingSinceUtc) {
             $State.appServerMissingSinceUtc = $Now.ToString('o')
@@ -1321,12 +1385,14 @@ function Set-CodexStartupLauncher {
 }
 
 function Stop-CodexPackageProcesses {
+    <# .SYNOPSIS Stops recognized package processes only when no unknown live direct app server is present. #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Config
     )
 
     $observation = Get-CodexProcessObservation -Package $Package
+    if ($observation.AppServerStatus -eq 'Unknown') { throw 'An unrecognized live Codex app-server was found; refusing to close or stop the application.' }
     foreach ($rootId in @($observation.RootProcessIds)) {
         try {
             $process = Get-Process -Id $rootId -ErrorAction Stop
@@ -1344,6 +1410,7 @@ function Stop-CodexPackageProcesses {
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
 
     $remaining = Get-CodexProcessObservation -Package $Package
+    if ($remaining.AppServerStatus -eq 'Unknown') { throw 'An unrecognized live Codex app-server appeared; refusing to force-stop the application.' }
     foreach ($processId in @($remaining.AllPackageProcessIds)) {
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
@@ -1362,7 +1429,7 @@ function Wait-CodexHealthyProcesses {
         $package = Get-CodexPackageInfo -Config $Config
         if (-not $package.Found) { $package = $InitialPackage }
         $process = Get-CodexProcessObservation -Package $package
-        if ($process.DesktopPresent -and $process.AppServerPresent) {
+        if ($process.DesktopPresent -and $process.AppServerPresent -and $process.AppServerStatus -ne 'Unknown') {
             return [ordered]@{ Package = $package; Process = $process }
         }
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
@@ -1584,6 +1651,10 @@ function ConvertTo-PublicResult {
         packageVersion        = $Observation.Package.Version
         desktopPresent        = $Observation.Process.DesktopPresent
         appServerPresent      = $Observation.Process.AppServerPresent
+        appServerStatus       = if ($Observation.Process.Contains('AppServerStatus')) { $Observation.Process.AppServerStatus } elseif ($Observation.Process.AppServerPresent) { 'Recognized' } else { 'Missing' }
+        unknownAppServerProcessIds = @(if ($Observation.Process.Contains('UnknownAppServerProcessIds')) { $Observation.Process.UnknownAppServerProcessIds })
+        unknownAppServerExecutables = @(if ($Observation.Process.Contains('UnknownAppServerExecutables')) { $Observation.Process.UnknownAppServerExecutables })
+        appServerOverride     = if ($Observation.Package.Contains('AppServerOverride')) { $Observation.Package.AppServerOverride } else { $null }
         rootProcessIds        = @($Observation.Process.RootProcessIds)
         appServerProcessIds   = @($Observation.Process.AppServerProcessIds)
         databaseIntegrity     = $Observation.Integrity

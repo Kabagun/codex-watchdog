@@ -354,6 +354,148 @@ Describe 'Hidden scheduled-task launcher' {
     }
 }
 
+Describe 'Configured core recognition and safe uncertainty' {
+    BeforeEach {
+        $config=Get-WatchdogConfig
+        $now=[DateTimeOffset]::Parse('2026-10-18T09:30:00Z')
+        $state=New-WatchdogState
+        $fixture=Join-Path $TestDrive ('ядро с пробелами '+[guid]::NewGuid())
+        $core=Join-Path $fixture 'current\codex.exe'
+        $oldCore=Join-Path $fixture 'old\codex.exe'
+        $null=New-Item -ItemType Directory -Path (Split-Path -Parent $core),(Split-Path -Parent $oldCore) -Force
+        Set-Content -LiteralPath $core,$oldCore -Value 'executable fixture; never executed'
+        $package=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable='C:\WindowsApps\OpenAI.Codex_fixture\app\ChatGPT.exe'
+            AppServerExecutable='C:\WindowsApps\OpenAI.Codex_fixture\app\resources\codex.exe'
+            AppServerBinRoot='C:\Users\Fixture\AppData\Local\OpenAI\Codex\bin'
+            AppServerOverride=(Get-CodexAppServerOverride -EnvironmentValues @{User=$core;Machine='';Process=$oldCore})
+        }
+        $main=[pscustomobject]@{ProcessId=20;ParentProcessId=1;Name='ChatGPT.exe';ExecutablePath=$package.DesktopExecutable;CommandLine='desktop';CreationDate=$now.AddMinutes(-20)}
+        $server=[pscustomobject]@{ProcessId=21;ParentProcessId=20;Name='codex.exe';ExecutablePath=$core;CommandLine='codex.exe -c features.code_mode_host=true app-server --analytics-default-enabled';CreationDate=$now.AddMinutes(-19)}
+    }
+
+    It 'prefers fresh persisted User and Machine values to a stale inherited environment' {
+        $package.AppServerOverride.Executable | Should Be ([IO.Path]::GetFullPath($core))
+        $package.AppServerOverride.Source | Should Be 'User'
+        $machine=Get-CodexAppServerOverride -EnvironmentValues @{User='';Machine=$core;Process=$oldCore}
+        $machine.Executable | Should Be ([IO.Path]::GetFullPath($core))
+        $machine.Source | Should Be 'Machine'
+        $process=Get-CodexAppServerOverride -EnvironmentValues @{User='';Machine='';Process=$oldCore}
+        $process.Executable | Should Be ([IO.Path]::GetFullPath($oldCore))
+        $process.Source | Should Be 'Process'
+    }
+
+    It 'rejects invalid selected overrides without silently using an older core' {
+        foreach($invalid in @('codex.exe',(Join-Path $fixture 'missing\codex.exe'),(Join-Path $fixture 'other.exe'))){
+            $resolved=Get-CodexAppServerOverride -EnvironmentValues @{User=$invalid;Machine=$core;Process=$oldCore}
+            $resolved.Executable | Should Be ''
+            $resolved.Source | Should Be 'User'
+            [bool]$resolved.Error | Should Be $true
+        }
+        $empty=Get-CodexAppServerOverride -EnvironmentValues @{}
+        $empty.Source | Should Be 'None'
+        $empty.Executable | Should Be ''
+    }
+
+    It 'recognizes only the exact configured file with the installed main ancestry and server role' {
+        $recognized=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $recognized.AppServerPresent | Should Be $true
+        $recognized.AppServerStatus | Should Be 'Recognized'
+        @($recognized.AppServerProcessIds) | Should Be @(21)
+        ($recognized.AllPackageProcessIds -contains 21) | Should Be $true
+        $observation=New-TestObservation
+        $observation.TimestampUtc=$now.ToString('o');$observation.Process=$recognized;$observation.Package=$package
+        $public=ConvertTo-PublicResult -Observation $observation -Decision (New-WatchdogDecision -Action None -Reason HealthyIdle)
+        $public.appServerStatus | Should Be 'Recognized'
+        ($public.unknownAppServerProcessIds -is [array]) | Should Be $true
+        @($public.unknownAppServerProcessIds).Count | Should Be 0
+        $server.ParentProcessId=999
+        $foreignParent=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $foreignParent.AppServerStatus | Should Be 'Missing'
+        $foreignParent.AppServerPresent | Should Be $false
+        @($foreignParent.UnknownAppServerProcessIds).Count | Should Be 0
+        $server.ParentProcessId=20;$server.CommandLine='codex.exe exec task'
+        (Get-CodexProcessObservation -Package $package -Processes @($main,$server)).AppServerStatus | Should Be 'Missing'
+        $server.CommandLine='codex.exe app-server';$main.ExecutablePath='C:\Other\ChatGPT.exe'
+        $foreignMain=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $foreignMain.DesktopPresent | Should Be $false
+        $foreignMain.AppServerPresent | Should Be $false
+    }
+
+    It 'keeps stock package and versioned core paths recognized' {
+        foreach($path in @($package.AppServerExecutable,(Join-Path $package.AppServerBinRoot 'version\codex.exe'))){
+            $server.ExecutablePath=$path
+            $stock=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+            $stock.AppServerPresent | Should Be $true
+            $stock.AppServerStatus | Should Be 'Recognized'
+        }
+    }
+
+    It 'pauses automatic recovery when an override changes while its old direct server is still alive' {
+        $server.ExecutablePath=$oldCore
+        $unknown=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $unknown.AppServerPresent | Should Be $false
+        $unknown.AppServerStatus | Should Be 'Unknown'
+        @($unknown.UnknownAppServerProcessIds) | Should Be @(21)
+        @($unknown.UnknownAppServerExecutables) | Should Be @($oldCore)
+        ($unknown.AllPackageProcessIds -contains 21) | Should Be $false
+        $observation=New-TestObservation -RemoteRepeatedFailure $true
+        $observation.Process=$unknown
+        $observation.Package=$package
+        $state.appServerMissingSinceUtc=$now.AddHours(-1).ToString('o');$state.appServerMissingChecks=25
+        $decision=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+        $decision.Action | Should Be 'Manual'
+        $decision.Reason | Should Be 'UnrecognizedAppServer'
+        $state.appServerMissingChecks | Should Be 0
+        ($null -eq $state.appServerMissingSinceUtc) | Should Be $true
+        $validation=Get-TriggerValidationReport -Decision $decision -Observation $observation -State $state -Config $config -Now $now
+        $validation.checks[0].name | Should Be 'AppServerExecutableRecognized'
+    }
+
+    It 'protects an unreadable direct server but does not recognize unknown nested CLI servers' {
+        $server.ExecutablePath=$null
+        (Get-CodexProcessObservation -Package $package -Processes @($main,$server)).AppServerStatus | Should Be 'Unknown'
+        $tool=[pscustomobject]@{ProcessId=30;ParentProcessId=20;Name='codex.exe';ExecutablePath=$core;CommandLine='codex.exe exec tool'}
+        $server.ExecutablePath=$oldCore;$server.ParentProcessId=30
+        $nested=Get-CodexProcessObservation -Package $package -Processes @($main,$tool,$server)
+        $nested.AppServerStatus | Should Be 'Missing'
+        @($nested.UnknownAppServerProcessIds).Count | Should Be 0
+        $server.ParentProcessId=20
+        $unknownAlongsideKnown=Get-CodexProcessObservation -Package $package -Processes @($main,$server,([pscustomobject]@{ProcessId=22;ParentProcessId=20;Name='codex.exe';ExecutablePath=$core;CommandLine='codex.exe app-server'}))
+        $unknownAlongsideKnown.AppServerPresent | Should Be $true
+        $unknownAlongsideKnown.AppServerStatus | Should Be 'Unknown'
+        $validation=Get-RecoveryValidationReport -BeforePackage $package -AfterPackage $package -Process $unknownAlongsideKnown -Integrity ([ordered]@{State='ok';Logs='ok'}) -Enrollment ([ordered]@{Status='Enabled';EnabledCount=1})
+        @($validation.checks|Where-Object { $_.name -eq 'AppServerExecutableRecognized' -and $_.status -eq 'failed' }).Count | Should Be 1
+    }
+
+    It 'never closes or stops any process when a direct unknown server is alive' {
+        $server.ExecutablePath=$oldCore
+        $script:unknownObservation=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $script:stopGuardPackage=$package
+        Mock Get-CodexProcessObservation { $script:unknownObservation } -ParameterFilter { [object]::ReferenceEquals($Package,$script:stopGuardPackage) }
+        Mock Get-Process { throw 'Process lookup/close must not be reached.' }
+        Mock Stop-Process { throw 'No process may be stopped.' }
+        $failure=$null
+        try{Stop-CodexPackageProcesses -Package $package -Config $config}catch{$failure=$_}
+        $failure.Exception.Message | Should Be 'An unrecognized live Codex app-server was found; refusing to close or stop the application.'
+        Assert-MockCalled Get-Process -Times 0 -Exactly -Scope It
+        Assert-MockCalled Stop-Process -Times 0 -Exactly -Scope It
+    }
+
+    It 'retains the observation window and recovery decision for a genuinely missing server' {
+        $observation=New-TestObservation -AppServerPresent $false
+        $observation.Process=Get-CodexProcessObservation -Package $package -Processes @($main)
+        $observation.Process.AppServerStatus | Should Be 'Missing'
+        $initial=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+        $initial.Reason | Should Be 'AppServerMissingObservationWindow'
+        $later=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now.AddMinutes(6)
+        $later.Reason | Should Be 'AppServerMissingObservationWindow'
+        $confirmed=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now.AddMinutes(7)
+        $confirmed.Action | Should Be 'Restart'
+        $confirmed.Reason | Should Be 'AppServerMissing'
+    }
+}
+
 function New-EnhancedLauncherFixture {
     param([Parameter(Mandatory)][string]$UserHome)
     $root = Join-Path $UserHome '.agents\skills\better-codex'
