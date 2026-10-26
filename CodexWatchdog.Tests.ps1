@@ -85,6 +85,22 @@ function Write-RolloutFixture {
     return $path
 }
 
+function Write-TestDesktopHandshakeFile {
+    param(
+        [Parameter(Mandatory)][string]$LogsRoot,
+        [Parameter(Mandatory)][int]$FileProcessId,
+        [Parameter(Mandatory)][DateTimeOffset]$Timestamp,
+        [Parameter(Mandatory)][string]$Line,
+        [string]$Payload=''
+    )
+    $date=$Timestamp.UtcDateTime
+    $directory=Join-Path $LogsRoot (Join-Path $date.ToString('yyyy') (Join-Path $date.ToString('MM') $date.ToString('dd')))
+    $null=New-Item -ItemType Directory -Path $directory -Force
+    $path=Join-Path $directory ('codex-desktop-fixture-{0}-t0-i1-000000-0.log' -f $FileProcessId)
+    [IO.File]::WriteAllText($path,$Line+[Environment]::NewLine+$Payload,[Text.UTF8Encoding]::new($false))
+    return $path
+}
+
 function New-ManagedCoreFixture {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -1055,6 +1071,122 @@ Describe 'Cached stock core identity' {
     }
 }
 
+Describe 'Desktop initialization handshake verification' {
+    BeforeEach {
+        $script:handshakeLogsRoot=Join-Path $TestDrive ('desktop-log-fixture '+[guid]::NewGuid())
+        $null=New-Item -ItemType Directory -Path $script:handshakeLogsRoot -Force
+        $script:handshakeRootStart=[DateTimeOffset]::Parse('2026-10-26T18:31:20.0000000Z')
+        $script:handshakeTimestamp=$script:handshakeRootStart.AddSeconds(5)
+        $script:handshakeProcessId=74123
+        $script:handshakeRootPath=Join-Path $TestDrive 'synthetic-app\ChatGPT.exe'
+        $script:handshakeRootIdentity=[ordered]@{
+            processId=$script:handshakeProcessId;startedUtc=$script:handshakeRootStart.ToString('o')
+            executablePath=$script:handshakeRootPath
+        }
+        $script:handshakeLogsConfig=Get-WatchdogConfig
+        $script:handshakeLogsConfig.DesktopLogsRoot=$script:handshakeLogsRoot
+        $script:handshakeEventLine='{0} [AppServerConnection] initialize_handshake_result outcome=success transportKind=stdio' -f $script:handshakeTimestamp.ToString('o')
+    }
+
+    It 'finds a current PID handshake in bounded file-head and file-tail slices' {
+        $path=Write-TestDesktopHandshakeFile -LogsRoot $script:handshakeLogsRoot -FileProcessId $script:handshakeProcessId `
+            -Timestamp $script:handshakeTimestamp -Line $script:handshakeEventLine -Payload ('x'*700000)
+        $head=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $head.AllRequiredProcessesVerified | Should Be $true
+        $head.VerifiedProcessIds | Should Be @($script:handshakeProcessId)
+        $head.Status | Should Be 'Verified'
+        ($head|ConvertTo-Json -Compress) | Should Not Match 'initialize_handshake_result|xxxx'
+
+        [IO.File]::WriteAllText($path,('x'*700000)+[Environment]::NewLine+$script:handshakeEventLine+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
+        $tail=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $tail.AllRequiredProcessesVerified | Should Be $true
+    }
+
+    It 'rejects old, wrong-PID, websocket, failed and embedded handshake text' {
+        $wrongPidPath=Write-TestDesktopHandshakeFile -LogsRoot $script:handshakeLogsRoot `
+            -FileProcessId ($script:handshakeProcessId+1) -Timestamp $script:handshakeTimestamp -Line $script:handshakeEventLine
+        $wrongPid=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $wrongPid.AllRequiredProcessesVerified | Should Be $false
+        $wrongPid.Status | Should Be 'NoPidLogs'
+
+        $path=Write-TestDesktopHandshakeFile -LogsRoot $script:handshakeLogsRoot -FileProcessId $script:handshakeProcessId `
+            -Timestamp $script:handshakeRootStart.AddSeconds(-1) `
+            -Line ('{0} [AppServerConnection] initialize_handshake_result outcome=success transportKind=stdio' -f $script:handshakeRootStart.AddSeconds(-1).ToString('o'))
+        $old=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $old.AllRequiredProcessesVerified | Should Be $false
+
+        [IO.File]::WriteAllText($path,('{0} [AppServerConnection] initialize_handshake_result outcome=success transportKind=websocket' -f $script:handshakeTimestamp.ToString('o')),[Text.UTF8Encoding]::new($false))
+        $websocket=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $websocket.AllRequiredProcessesVerified | Should Be $false
+
+        [IO.File]::WriteAllText($path,('{0} [AppServerConnection] initialize_handshake_result outcome=error transportKind=stdio' -f $script:handshakeTimestamp.ToString('o')),[Text.UTF8Encoding]::new($false))
+        $failed=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $failed.AllRequiredProcessesVerified | Should Be $false
+
+        [IO.File]::WriteAllText($path,('{0} [OtherLogger] payload contains [AppServerConnection] initialize_handshake_result outcome=success transportKind=stdio' -f $script:handshakeTimestamp.ToString('o')),[Text.UTF8Encoding]::new($false))
+        $embedded=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $embedded.AllRequiredProcessesVerified | Should Be $false
+    }
+}
+
+Describe 'Desktop handshake readiness gate' {
+    BeforeEach {
+        $script:handshakeWaitLogs=Join-Path $TestDrive ('wait-handshake-logs '+[guid]::NewGuid())
+        $null=New-Item -ItemType Directory -Path $script:handshakeWaitLogs -Force
+        $script:handshakeWaitConfig=Get-WatchdogConfig
+        $script:handshakeWaitConfig.DesktopLogsRoot=$script:handshakeWaitLogs
+        $script:handshakeWaitStart=[DateTimeOffset]::UtcNow.AddMinutes(-2)
+        $script:handshakeWaitPid=84231
+        $script:handshakeWaitPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=(Join-Path $TestDrive 'wait-app\ChatGPT.exe')
+            AppServerExecutable=(Join-Path $TestDrive 'wait-app\resources\codex.exe');AppServerOverride=$null
+        }
+        $script:handshakeWaitExpected=Get-CodexDesiredCoreIdentity -Package $script:handshakeWaitPackage
+        $script:handshakeWaitRootIdentity=[ordered]@{
+            processId=$script:handshakeWaitPid;startedUtc=$script:handshakeWaitStart.ToString('o')
+            executablePath=$script:handshakeWaitPackage.DesktopExecutable
+        }
+        $script:handshakeWaitProcess=[ordered]@{
+            CoreSelection=$script:handshakeWaitExpected;DesktopPresent=$true;SelectedCorePresent=$true
+            TrustedPreviousCorePresent=$false;AppServerStatus='Recognized'
+            RootProcessIdentities=@($script:handshakeWaitRootIdentity)
+            AppServerProcessIdentities=@([ordered]@{classification='Stock';desktopProcessId=$script:handshakeWaitPid})
+        }
+        Mock Start-Sleep {}
+        Mock Get-CodexPackageInfo { $script:handshakeWaitPackage }
+        Mock Get-CodexProcessObservation { $script:handshakeWaitProcess }
+    }
+
+    It 'keeps ordinary readiness unchanged but blocks selected-core readiness without a current handshake' {
+        $ordinary=Wait-CodexHealthyProcesses -Config $script:handshakeWaitConfig -InitialPackage $script:handshakeWaitPackage `
+            -TimeoutSeconds 0 -ExpectedCore $script:handshakeWaitExpected
+        $ordinary.Ready | Should Be $true
+        $ordinary.DesktopHandshake | Should Be $null
+
+        $protected=Wait-CodexHealthyProcesses -Config $script:handshakeWaitConfig -InitialPackage $script:handshakeWaitPackage `
+            -TimeoutSeconds 0 -ExpectedCore $script:handshakeWaitExpected -RequireDesktopHandshake
+        $protected.Ready | Should Be $false
+        $protected.DesktopHandshake.AllRequiredProcessesVerified | Should Be $false
+        $protected.DesktopHandshake.Status | Should Be 'NoPidLogs'
+
+        $stamp=$script:handshakeWaitStart.AddSeconds(10)
+        $line='{0} [AppServerConnection] initialize_handshake_result outcome=success transportKind=stdio' -f $stamp.ToString('o')
+        $null=Write-TestDesktopHandshakeFile -LogsRoot $script:handshakeWaitLogs -FileProcessId $script:handshakeWaitPid `
+            -Timestamp $stamp -Line $line
+        $verified=Wait-CodexHealthyProcesses -Config $script:handshakeWaitConfig -InitialPackage $script:handshakeWaitPackage `
+            -TimeoutSeconds 0 -ExpectedCore $script:handshakeWaitExpected -RequireDesktopHandshake
+        $verified.Ready | Should Be $true
+        $verified.DesktopHandshake.AllRequiredProcessesVerified | Should Be $true
+    }
+}
+
 Describe 'Managed core switching and rollback gates' {
     BeforeEach {
         $config=Get-WatchdogConfig
@@ -1428,13 +1560,20 @@ Describe 'Managed core switching and rollback gates' {
         Mock Get-CodexPackageInfo { $script:rollbackPackage }
         Mock Get-CodexDesktopLaunchPlan { [ordered]@{Mode='Enhanced';CanLaunch=$true} }
         Mock Start-CodexDesktop { [ordered]@{Mode='Enhanced'} }
-        Mock Wait-CodexHealthyProcesses { [ordered]@{Ready=$true;Package=$script:rollbackPackage;Process=$script:rollbackProcess} }
+        Mock Wait-CodexHealthyProcesses {
+            [ordered]@{
+                Ready=$true;Package=$script:rollbackPackage;Process=$script:rollbackProcess
+                DesktopHandshake=[ordered]@{Verified=$true;Status='Verified';VerifiedProcessIds=@(30);RequiredProcessIds=@(30);AllRequiredProcessesVerified=$true}
+            }
+        } -ParameterFilter { $RequireDesktopHandshake }
         Mock Get-CodexDatabasePaths { [ordered]@{State='state';Logs='logs'} }
         Mock Test-CodexDatabaseIntegrity { [ordered]@{Healthy=$true;State='ok';Logs='ok'} }
         Mock Get-RemoteEnrollmentObservation { [ordered]@{Status='Enabled';EnabledCount=1} }
         $rollback=Invoke-CoreSelectionRollback -Config $config -State $state -Attempt $attempt -CurrentPackage $newPackage -TimeoutSeconds 1 -EnvironmentValues @{User=$new.Path;Machine=''}
         $rollback.Successful | Should Be $true
+        $rollback.DesktopHandshake.AllRequiredProcessesVerified | Should Be $true
         $script:rollbackEnvironmentWrites | Should Be 1
+        Assert-MockCalled Wait-CodexHealthyProcesses -Times 1 -Exactly -Scope It -ParameterFilter { $RequireDesktopHandshake }
         $again=Invoke-CoreSelectionRollback -Config $config -State $state -Attempt $attempt -CurrentPackage $newPackage -TimeoutSeconds 1 -EnvironmentValues @{User=$new.Path;Machine=''}
         $again.Reason | Should Be 'RollbackAlreadyAttempted'
         $script:rollbackEnvironmentWrites | Should Be 1
@@ -1766,5 +1905,86 @@ Describe 'Watchdog validation diagnostics' {
         $record.validation.phase | Should Be 'trigger'
         $record.validation.checks[0].name | Should Be 'DesktopProcessPresent'
         $record.validation.checks[0].status | Should Be 'failed'
+    }
+}
+
+Describe 'Core-switch recovery handshake opt-in' {
+    BeforeEach {
+        $config=Get-WatchdogConfig
+        $now=[DateTimeOffset]::Parse('2026-10-26T10:00:00Z')
+        $state=New-WatchdogState
+        $script:coreHandshakeRoot=Join-Path $TestDrive ('recovery-handshake '+[guid]::NewGuid())
+        $script:coreHandshakeOld=New-ManagedCoreFixture -Root (Join-Path $script:coreHandshakeRoot 'old') -Version 'old-core'
+        $script:coreHandshakeNew=New-ManagedCoreFixture -Root (Join-Path $script:coreHandshakeRoot 'new') -Version 'future-core'
+        $script:coreHandshakeDesktop='C:\WindowsApps\Codex_fixture\app\ChatGPT.exe'
+        $script:coreHandshakeStock='C:\WindowsApps\Codex_fixture\app\resources\codex.exe'
+        $script:coreHandshakePackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$script:coreHandshakeDesktop;AppServerExecutable=$script:coreHandshakeStock
+            AppServerOverride=[ordered]@{
+                Executable=$script:coreHandshakeNew.Path;Source='User';RawValue=$script:coreHandshakeNew.Path
+                RegistryKind='String';Error=$null;Managed=$true;MetadataValidated=$true;HashVerified=$true
+                Sha256=$script:coreHandshakeNew.Hash;Version=$script:coreHandshakeNew.Version
+            }
+        }
+        $script:coreHandshakePrevious=New-ManagedCoreProcessFixture -Now $now `
+            -DesktopPath $script:coreHandshakeDesktop -CorePath $script:coreHandshakeOld.Path
+        $state.lastHealthyCore=[ordered]@{
+            selector=[ordered]@{source='User';path=$script:coreHandshakeOld.Path}
+            core=[ordered]@{kind='Managed';path=$script:coreHandshakeOld.Path;sha256=$script:coreHandshakeOld.Hash;version=$script:coreHandshakeOld.Version}
+            process=[ordered]@{
+                pid=21;startUtc=$script:coreHandshakePrevious.ServerStartUtc
+                desktopPid=20;desktopStartUtc=$script:coreHandshakePrevious.DesktopStartUtc
+            }
+            healthyAtUtc=$now.AddMinutes(-1).ToString('o')
+        }
+        $script:coreHandshakeSelectedServer=[pscustomobject]@{
+            ProcessId=31;ParentProcessId=20;Name='codex.exe';ExecutablePath=$script:coreHandshakeNew.Path
+            CommandLine='codex.exe app-server';CreationDate=$now.AddMinutes(-1)
+        }
+        $script:coreHandshakeSelectedProcess=Get-CodexProcessObservation -Package $script:coreHandshakePackage `
+            -Processes @($script:coreHandshakePrevious.Desktop,$script:coreHandshakeSelectedServer) `
+            -TrustedPreviousCore $state.lastHealthyCore
+        $script:coreHandshakeObservation=New-TestObservation
+        $script:coreHandshakeObservation.Package=$script:coreHandshakePackage
+        $script:coreHandshakeObservation.Process=Get-CodexProcessObservation -Package $script:coreHandshakePackage `
+            -Processes @($script:coreHandshakePrevious.Desktop,$script:coreHandshakePrevious.Server) `
+            -TrustedPreviousCore $state.lastHealthyCore
+        $config.DataRoot=Join-Path $TestDrive 'core-handshake-state'
+        $config.StatePath=Join-Path $config.DataRoot 'state.json'
+        $config.SnapshotRoot=Join-Path $config.DataRoot 'snapshots'
+        $script:coreHandshakeConfig=$config
+        $script:coreHandshakeState=$state
+        $script:coreHandshakeNow=$now
+    }
+
+    It 'requires the real Wait readiness gate with a successful current Desktop handshake for a core switch' {
+        $script:coreHandshakeProof=[ordered]@{
+            Verified=$true;Status='Verified';VerifiedProcessIds=@(20);RequiredProcessIds=@(20)
+            AllRequiredProcessesVerified=$true;ExaminedFileCount=1;ReadErrorCount=0
+        }
+        Mock Write-DiagnosticSnapshot {}
+        Mock Write-WatchdogEvent {}
+        Mock Get-CodexPackageInfo { $script:coreHandshakePackage }
+        Mock Get-CodexProcessObservation { $script:coreHandshakeSelectedProcess }
+        Mock Get-CodexDesktopLaunchPlan { [ordered]@{Mode='Enhanced';CanLaunch=$true} }
+        Mock Stop-CodexPackageProcesses {}
+        Mock Start-CodexDesktop { [ordered]@{Mode='Enhanced'} }
+        Mock Wait-CodexHealthyProcesses {
+            [ordered]@{
+                Ready=$true;Package=$script:coreHandshakePackage;Process=$script:coreHandshakeSelectedProcess
+                DesktopHandshake=$script:coreHandshakeProof
+            }
+        } -ParameterFilter { $RequireDesktopHandshake }
+        Mock Get-CodexDatabasePaths { [ordered]@{State='state';Logs='logs'} }
+        Mock Test-CodexDatabaseIntegrity { [ordered]@{Healthy=$true;State='ok';Logs='ok'} }
+        Mock Get-RemoteEnrollmentObservation { [ordered]@{Status='Enabled';EnabledCount=1} }
+
+        $result=Invoke-CodexRecovery -Mode Restart -Config $script:coreHandshakeConfig -State $script:coreHandshakeState `
+            -Observation $script:coreHandshakeObservation `
+            -Decision (New-WatchdogDecision -Action Restart -Reason 'CoreSelectionChanged') -Now $script:coreHandshakeNow
+
+        $result.Successful | Should Be $true
+        $result.Validation.checks | Where-Object name -eq 'DesktopInitializeHandshake' | Select-Object -ExpandProperty status | Should Be 'passed'
+        Assert-MockCalled Wait-CodexHealthyProcesses -Times 1 -Exactly -Scope It -ParameterFilter { $RequireDesktopHandshake }
     }
 }

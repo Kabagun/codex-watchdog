@@ -36,6 +36,7 @@ function Get-WatchdogConfig {
         TaskName                      = 'Codex Remote Watchdog'
         TaskPath                      = '\Codex\'
         CodexHome                     = $codexHome
+        DesktopLogsRoot               = Join-Path $env:LOCALAPPDATA 'Codex\Logs'
         SessionsRoot                  = Join-Path $codexHome 'sessions'
         DataRoot                      = $dataRoot
         StatePath                     = Join-Path $dataRoot 'state.json'
@@ -2380,15 +2381,174 @@ function Stop-CodexPackageProcesses {
     }
 }
 
+function Get-CodexDesktopHandshakeObservation {
+    <# .SYNOPSIS Verifies a current Desktop PID's successful stdio initialization handshake without exposing log text. #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [object[]]$RootProcessIdentities = @(),
+        [int[]]$RequiredProcessIds = @()
+    )
+
+    $verifiedByProcessId=@{}
+    $examinedFileCount=0
+    $matchingFileCount=0
+    $readErrorCount=0
+    $logsRoot=[string](Get-JsonPropertyValue -Object $Config -Name 'DesktopLogsRoot')
+    if(-not $logsRoot){$logsRoot=Join-Path $env:LOCALAPPDATA 'Codex\Logs'}
+    $roots=@($RootProcessIdentities | Where-Object {
+        [int](Get-JsonPropertyValue -Object $_ -Name 'processId') -gt 0
+    })
+    $requiredIds=@($RequiredProcessIds | ForEach-Object {[int]$_} | Where-Object {$_ -gt 0} | Select-Object -Unique)
+    $checkedAtUtc=[DateTimeOffset]::UtcNow.ToString('o')
+
+    if(-not (Test-Path -LiteralPath $logsRoot -PathType Container)){
+        return [ordered]@{
+            Verified=$false;Status='LogsRootUnavailable';VerifiedProcessIds=@();RequiredProcessIds=$requiredIds
+            AllRequiredProcessesVerified=$false;ExaminedFileCount=0;ReadErrorCount=0;CheckedAtUtc=$checkedAtUtc
+        }
+    }
+    if($roots.Count -eq 0){
+        return [ordered]@{
+            Verified=$false;Status='NoDesktopRoots';VerifiedProcessIds=@();RequiredProcessIds=$requiredIds
+            AllRequiredProcessesVerified=$false;ExaminedFileCount=0;ReadErrorCount=0;CheckedAtUtc=$checkedAtUtc
+        }
+    }
+    if($roots.Count -gt 8){
+        return [ordered]@{
+            Verified=$false;Status='TooManyDesktopRoots';VerifiedProcessIds=@();RequiredProcessIds=$requiredIds
+            AllRequiredProcessesVerified=$false;ExaminedFileCount=0;ReadErrorCount=0;CheckedAtUtc=$checkedAtUtc
+        }
+    }
+
+    $filesPerEdge=4
+    $headByteLimit=262144
+    $tailByteLimit=262144
+    $maximumLinesPerSegment=10000
+    $eventPrefixPattern='(?i)^\s*(?<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:?\d{2}))\s+(?:(?:\[(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\]|(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL))\s+)?\[AppServerConnection\]\s+initialize_handshake_result\b(?<payload>.*)$'
+    $outcomePattern='(?i)(?:^|[\s,{])"?outcome"?\s*[:=]\s*"?(?<value>[A-Za-z0-9_-]+)"?'
+    $transportPattern='(?i)(?:^|[\s,{])"?transportKind"?\s*[:=]\s*"?(?<value>[A-Za-z0-9_-]+)"?'
+
+    foreach($rootIdentity in $roots){
+        $processId=[int](Get-JsonPropertyValue -Object $rootIdentity -Name 'processId')
+        $startedValue=Get-JsonPropertyValue -Object $rootIdentity -Name 'startedUtc'
+        $executablePath=[string](Get-JsonPropertyValue -Object $rootIdentity -Name 'executablePath')
+        if(-not $startedValue -or [IO.Path]::GetFileName($executablePath) -ine 'ChatGPT.exe'){continue}
+        try{$rootStartedUtc=ConvertTo-UtcDateTimeOffset $startedValue}catch{continue}
+
+        $dateDirectories=[System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach($baseDate in @($rootStartedUtc.UtcDateTime.Date,$rootStartedUtc.ToLocalTime().Date)){
+            foreach($dayOffset in @(-1,0,1)){
+                $candidateDate=$baseDate.AddDays($dayOffset)
+                $datePath=Join-Path $logsRoot (Join-Path $candidateDate.ToString('yyyy') (Join-Path $candidateDate.ToString('MM') $candidateDate.ToString('dd')))
+                $null=$dateDirectories.Add($datePath)
+            }
+        }
+
+        $pidFilePattern='(?i)^codex-desktop-.+-'+[Regex]::Escape([string]$processId)+'-t\d+-i\d+-\d+-\d+\.log$'
+        $matchingFiles=[System.Collections.Generic.List[System.IO.FileInfo]]::new()
+        foreach($dateDirectory in $dateDirectories){
+            if(-not (Test-Path -LiteralPath $dateDirectory -PathType Container)){continue}
+            try{
+                $dateFiles=@(Get-ChildItem -LiteralPath $dateDirectory -Filter 'codex-desktop-*.log' -File -Force -ErrorAction Stop |
+                    Where-Object {$_.Name -match $pidFilePattern})
+                foreach($dateFile in $dateFiles){$matchingFiles.Add($dateFile)}
+            }catch{$readErrorCount++}
+        }
+        $orderedFiles=@($matchingFiles | Sort-Object LastWriteTimeUtc,FullName)
+        $matchingFileCount+=$orderedFiles.Count
+        if($orderedFiles.Count -gt ($filesPerEdge*2)){
+            $candidateFiles=@(@($orderedFiles | Select-Object -First $filesPerEdge)+@($orderedFiles | Select-Object -Last $filesPerEdge) |
+                Sort-Object LastWriteTimeUtc,FullName | Select-Object -Unique -Property FullName)
+        }else{$candidateFiles=$orderedFiles}
+
+        foreach($candidateFile in $candidateFiles){
+            $stream=$null
+            try{
+                $share=[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+                $stream=[IO.FileStream]::new($candidateFile.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,$share)
+                $examinedFileCount++
+                $fileLength=$stream.Length
+                $segments=@(
+                    [ordered]@{Offset=[long]0;Length=[long][Math]::Min($headByteLimit,$fileLength)}
+                    [ordered]@{Offset=[long][Math]::Max(0,$fileLength-$tailByteLimit);Length=[long][Math]::Min($tailByteLimit,$fileLength)}
+                )
+                $usedOffsets=@{}
+                foreach($segment in $segments){
+                    if($segment.Length -le 0 -or $usedOffsets.ContainsKey([string]$segment.Offset)){continue}
+                    $usedOffsets[[string]$segment.Offset]=$true
+                    $null=$stream.Seek([long]$segment.Offset,[IO.SeekOrigin]::Begin)
+                    $buffer=[byte[]]::new([int]$segment.Length)
+                    $bytesRead=0
+                    while($bytesRead -lt $buffer.Length){
+                        $readCount=$stream.Read($buffer,$bytesRead,$buffer.Length-$bytesRead)
+                        if($readCount -le 0){break}
+                        $bytesRead+=$readCount
+                    }
+                    if($bytesRead -le 0){continue}
+                    $segmentText=[Text.Encoding]::UTF8.GetString($buffer,0,$bytesRead)
+                    if($segment.Offset -gt 0){
+                        $firstNewline=$segmentText.IndexOf("`n")
+                        if($firstNewline -lt 0){continue}
+                        $segmentText=$segmentText.Substring($firstNewline+1)
+                    }
+                    if(($segment.Offset+$bytesRead) -lt $fileLength -and -not $segmentText.EndsWith("`n")){
+                        $lastNewline=$segmentText.LastIndexOf("`n")
+                        if($lastNewline -lt 0){continue}
+                        $segmentText=$segmentText.Substring(0,$lastNewline)
+                    }
+
+                    $stringReader=[IO.StringReader]::new($segmentText)
+                    try{
+                        $lineCount=0
+                        while($lineCount -lt $maximumLinesPerSegment){
+                            $line=$stringReader.ReadLine()
+                            if($null -eq $line){break}
+                            $lineCount++
+                            $eventMatch=[Regex]::Match($line,$eventPrefixPattern,[Text.RegularExpressions.RegexOptions]::CultureInvariant)
+                            if(-not $eventMatch.Success){continue}
+                            $outcomeMatch=[Regex]::Match($eventMatch.Groups['payload'].Value,$outcomePattern)
+                            $transportMatch=[Regex]::Match($eventMatch.Groups['payload'].Value,$transportPattern)
+                            if(-not $outcomeMatch.Success -or -not $transportMatch.Success -or
+                                $outcomeMatch.Groups['value'].Value -cne 'success' -or
+                                $transportMatch.Groups['value'].Value -cne 'stdio'){continue}
+                            try{$handshakeUtc=ConvertTo-UtcDateTimeOffset $eventMatch.Groups['timestamp'].Value}catch{continue}
+                            if($handshakeUtc -lt $rootStartedUtc){continue}
+                            if(-not $verifiedByProcessId.ContainsKey($processId) -or
+                                $handshakeUtc -gt $verifiedByProcessId[$processId]){$verifiedByProcessId[$processId]=$handshakeUtc}
+                        }
+                    }finally{$stringReader.Dispose()}
+                }
+            }catch{$readErrorCount++}
+            finally{if($stream){$stream.Dispose()}}
+        }
+    }
+
+    $verifiedIds=@($verifiedByProcessId.Keys | ForEach-Object {[int]$_} | Sort-Object)
+    $allRequiredVerified=$requiredIds.Count -gt 0 -and @($requiredIds | Where-Object {$verifiedByProcessId.ContainsKey([int]$_)}).Count -eq $requiredIds.Count
+    $status=if($allRequiredVerified){'Verified'}elseif($matchingFileCount -eq 0){'NoPidLogs'}elseif($readErrorCount -gt 0 -and $examinedFileCount -eq 0){'LogReadFailed'}else{'HandshakeNotVerified'}
+    return [ordered]@{
+        Verified=($verifiedIds.Count -gt 0)
+        Status=$status
+        VerifiedProcessIds=$verifiedIds
+        RequiredProcessIds=$requiredIds
+        AllRequiredProcessesVerified=[bool]$allRequiredVerified
+        ExaminedFileCount=$examinedFileCount
+        ReadErrorCount=$readErrorCount
+        CheckedAtUtc=$checkedAtUtc
+    }
+}
+
 function Wait-CodexHealthyProcesses {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
         [Parameter(Mandatory)][System.Collections.IDictionary]$InitialPackage,
         [Parameter(Mandatory)][int]$TimeoutSeconds,
         [Parameter(Mandatory)][System.Collections.IDictionary]$ExpectedCore,
-        [System.Collections.IDictionary]$TrustedPreviousCore
+        [System.Collections.IDictionary]$TrustedPreviousCore,
+        [switch]$RequireDesktopHandshake
     )
 
+    $lastHandshake=$null
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Seconds 2
@@ -2396,18 +2556,46 @@ function Wait-CodexHealthyProcesses {
         if (-not $package.Found) { continue }
         $process = Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
         $identityMatches = $process.CoreSelection -and (Test-CodexCoreSelectionMatches -Actual $process.CoreSelection -Expected $ExpectedCore)
-        if ($identityMatches -and $process.DesktopPresent -and $process.SelectedCorePresent -and
-            -not $process.TrustedPreviousCorePresent -and $process.AppServerStatus -eq 'Recognized') {
-            return [ordered]@{ Package=$package; Process=$process; Ready=$true }
+        $processReady=[bool]($identityMatches -and $process.DesktopPresent -and $process.SelectedCorePresent -and
+            -not $process.TrustedPreviousCorePresent -and $process.AppServerStatus -eq 'Recognized')
+        if($processReady -and $RequireDesktopHandshake){
+            $selectedDesktopIds=@((Get-JsonPropertyValue -Object $process -Name 'AppServerProcessIdentities') | Where-Object {
+                [string](Get-JsonPropertyValue -Object $_ -Name 'classification') -ne 'TrustedPrevious' -and
+                [int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId') -gt 0
+            } | ForEach-Object {[int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId')} | Select-Object -Unique)
+            $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config `
+                -RootProcessIdentities @(Get-JsonPropertyValue -Object $process -Name 'RootProcessIdentities') `
+                -RequiredProcessIds $selectedDesktopIds
+            $processReady=[bool]($selectedDesktopIds.Count -gt 0 -and $lastHandshake.AllRequiredProcessesVerified)
+        }
+        if ($processReady) {
+            return [ordered]@{ Package=$package; Process=$process; Ready=$true; DesktopHandshake=$lastHandshake }
         }
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
     $package = Get-CodexPackageInfo -Config $Config
-    if (-not $package.Found) { return [ordered]@{Package=$package;Process=(Get-CodexProcessObservation -Package $package);Ready=$false} }
+    if (-not $package.Found) {
+        $process=Get-CodexProcessObservation -Package $package
+        if($RequireDesktopHandshake){
+            $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config `
+                -RootProcessIdentities @(Get-JsonPropertyValue -Object $process -Name 'RootProcessIdentities')
+        }
+        return [ordered]@{Package=$package;Process=$process;Ready=$false;DesktopHandshake=$lastHandshake}
+    }
     $process = Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
     $matches = $process.CoreSelection -and (Test-CodexCoreSelectionMatches -Actual $process.CoreSelection -Expected $ExpectedCore)
-    $ready = [bool]($matches -and $process.DesktopPresent -and $process.SelectedCorePresent -and
+    $processReady=[bool]($matches -and $process.DesktopPresent -and $process.SelectedCorePresent -and
         -not $process.TrustedPreviousCorePresent -and $process.AppServerStatus -eq 'Recognized')
-    return [ordered]@{ Package=$package; Process=$process; Ready=$ready }
+    if($RequireDesktopHandshake){
+        $selectedDesktopIds=@((Get-JsonPropertyValue -Object $process -Name 'AppServerProcessIdentities') | Where-Object {
+            [string](Get-JsonPropertyValue -Object $_ -Name 'classification') -ne 'TrustedPrevious' -and
+            [int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId') -gt 0
+        } | ForEach-Object {[int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId')} | Select-Object -Unique)
+        $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config `
+            -RootProcessIdentities @(Get-JsonPropertyValue -Object $process -Name 'RootProcessIdentities') `
+            -RequiredProcessIds $selectedDesktopIds
+        $processReady=[bool]($processReady -and $selectedDesktopIds.Count -gt 0 -and $lastHandshake.AllRequiredProcessesVerified)
+    }
+    return [ordered]@{ Package=$package; Process=$process; Ready=$processReady; DesktopHandshake=$lastHandshake }
 }
 
 function Get-CodexDesiredCoreIdentity {
@@ -2542,8 +2730,12 @@ function Invoke-CoreSelectionRollback {
         $launchPlan = Get-CodexDesktopLaunchPlan -Package $rollbackPackage -UserHome $Config.UserHome
         if ($launchPlan.Mode -ne 'Enhanced') { return [ordered]@{Attempted=$true;Successful=$false;Reason='EnhancedLauncherUnavailable'} }
         $null = Start-CodexDesktop -Package $rollbackPackage -UserHome $Config.UserHome -LaunchPlan $launchPlan
-        $wait = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $rollbackPackage -TimeoutSeconds $TimeoutSeconds -ExpectedCore $expected
-        if (-not $wait.Ready) { return [ordered]@{Attempted=$true;Successful=$false;Reason='RollbackReadinessFailed'} }
+        $wait = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $rollbackPackage -TimeoutSeconds $TimeoutSeconds `
+            -ExpectedCore $expected -RequireDesktopHandshake
+        $rollbackHandshake=Get-JsonPropertyValue -Object $wait -Name 'DesktopHandshake'
+        if (-not $wait.Ready) {
+            return [ordered]@{Attempted=$true;Successful=$false;Reason='RollbackReadinessFailed';DesktopHandshake=$rollbackHandshake}
+        }
         $paths = Get-CodexDatabasePaths -Config $Config
         $integrity = Test-CodexDatabaseIntegrity -DatabasePaths $paths
         $enrollment = Get-RemoteEnrollmentObservation -DatabasePaths $paths
@@ -2552,7 +2744,7 @@ function Invoke-CoreSelectionRollback {
             Remote=[ordered]@{ManualCondition=$false}
         }
         if (Set-LastHealthyCoreFromObservation -State $State -Observation $rollbackObservation -Now ([DateTimeOffset]::UtcNow)) {
-            return [ordered]@{Attempted=$true;Successful=$true;Reason='RestoredLastHealthyCore'}
+            return [ordered]@{Attempted=$true;Successful=$true;Reason='RestoredLastHealthyCore';DesktopHandshake=$rollbackHandshake}
         }
         return [ordered]@{Attempted=$true;Successful=$false;Reason='RollbackHealthStateNotVerified'}
     } catch {
@@ -2616,7 +2808,9 @@ function Invoke-CodexRecovery {
         $launch = Start-CodexDesktop -Package $freshPackage -UserHome $Config.UserHome -LaunchPlan $launchPlan
         $launchStarted = $true
         $State.startupGraceUntilUtc = $Now.AddMinutes($Config.StartupGraceMinutes).ToString('o')
-        $waitResult = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $freshPackage -TimeoutSeconds $Config.RecoveryVerificationSeconds -ExpectedCore $expectedCore -TrustedPreviousCore $State.lastHealthyCore
+        $waitResult = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $freshPackage `
+            -TimeoutSeconds $Config.RecoveryVerificationSeconds -ExpectedCore $expectedCore `
+            -TrustedPreviousCore $State.lastHealthyCore -RequireDesktopHandshake:$coreSwitch
     } catch {
         $failureReason = if ($coreSwitch -and $_.Exception.Message -match 'unrecognized|unknown|identity|selection changed') { 'SafeRecoveryGate' } else { 'RecoveryOperationFailed' }
     }
@@ -2640,6 +2834,13 @@ function Invoke-CodexRecovery {
     $recoveryValidation = Get-RecoveryValidationReport -BeforePackage $Observation.Package -AfterPackage $verifiedPackage -Process $process -Integrity $integrity -Enrollment $enrollment -ExpectedCore $expectedCore
     if ($waitResult -and -not $waitResult.Ready) {
         $recoveryValidation.checks += New-ValidationCheck -Name 'SelectedCoreReadiness' -Status 'failed' -Expected 'Desktop and app server ready on the selected core' -Observed $process.AppServerStatus
+    }
+    if($coreSwitch -and $waitResult -and $waitResult.DesktopHandshake){
+        $handshake=$waitResult.DesktopHandshake
+        $recoveryValidation.checks += New-ValidationCheck -Name 'DesktopInitializeHandshake' `
+            -Status $(if($handshake.AllRequiredProcessesVerified){'passed'}else{'failed'}) `
+            -Expected 'Current Desktop initialize_handshake_result success over stdio' `
+            -Observed ([ordered]@{status=$handshake.Status;verifiedProcessIds=$handshake.VerifiedProcessIds;requiredProcessIds=$handshake.RequiredProcessIds})
     }
     if ($failureReason) {
         $recoveryValidation.checks += New-ValidationCheck -Name 'RecoveryOperation' -Status 'failed' -Expected 'Recovery completed safely' -Observed $failureReason
