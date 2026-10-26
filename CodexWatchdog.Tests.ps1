@@ -156,6 +156,301 @@ function New-ManagedCoreProcessFixture {
     return [ordered]@{Desktop=$main;Server=$server;DesktopStartUtc=(ConvertTo-UtcString $desktopStart);ServerStartUtc=(ConvertTo-UtcString $serverStart)}
 }
 
+function New-TestProcessHandle {
+    param([Parameter(Mandatory)][int]$ProcessId,[Parameter(Mandatory)][DateTime]$StartTime)
+
+    $handle=[pscustomobject]@{
+        Id=$ProcessId;StartTime=$StartTime
+        SafeHandleState=[ordered]@{Reads=0;Value=[pscustomobject]@{IsInvalid=$false;IsClosed=$false}}
+    }
+    Add-Member -InputObject $handle -MemberType ScriptProperty -Name SafeHandle -Value {
+        $this.SafeHandleState.Reads++
+        return $this.SafeHandleState.Value
+    }
+    Add-Member -InputObject $handle -MemberType ScriptProperty -Name HasExited -Value {
+        if ($script:shutdownHandleActions -and $script:shutdownHandleActions.ContainsKey([int]$this.Id)) {
+            return [bool]$script:shutdownHandleActions[[int]$this.Id].Exited
+        }
+        return $false
+    } -SecondValue {
+        param($value)
+        if ($script:shutdownHandleActions -and $script:shutdownHandleActions.ContainsKey([int]$this.Id)) {
+            $script:shutdownHandleActions[[int]$this.Id].Exited=[bool]$value
+        }
+    }
+    Add-Member -InputObject $handle -MemberType ScriptMethod -Name CloseMainWindow -Value {
+        $script:shutdownHandleActions[[int]$this.Id].CloseCount++
+        if ($script:shutdownHandleActions[[int]$this.Id].CloseExits) {
+            $this.HasExited=$true
+            $script:shutdownHandleActions[[int]$this.Id].Exited=$true
+        }
+        return $false
+    }
+    Add-Member -InputObject $handle -MemberType ScriptMethod -Name Kill -Value {
+        $script:shutdownHandleActions[[int]$this.Id].KillCount++
+        if ($script:shutdownHandleActions[[int]$this.Id].KillExits) {
+            $this.HasExited=$true
+            $script:shutdownHandleActions[[int]$this.Id].Exited=$true
+        }
+    }
+    Add-Member -InputObject $handle -MemberType ScriptMethod -Name Dispose -Value {
+        $this.SafeHandleState.Value.IsClosed=$true
+    }
+    return $handle
+}
+
+function New-StockCacheFixture {
+    param([Parameter(Mandatory)][string]$Root,[string]$Contents='fixture package stock core; never executed')
+
+    $bundled=Join-Path $Root 'package\app\resources\codex.exe'
+    $binRoot=Join-Path $Root 'user\OpenAI\Codex\bin'
+    $cached=Join-Path $binRoot '2993767bd1dfb009\codex.exe'
+    $null=New-Item -ItemType Directory -Path (Split-Path -Parent $bundled),(Split-Path -Parent $cached) -Force
+    [IO.File]::WriteAllText($bundled,$Contents,[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($cached,$Contents,[Text.UTF8Encoding]::new($false))
+    return [ordered]@{
+        Package=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=Join-Path $Root 'package\app\ChatGPT.exe'
+            AppServerExecutable=$bundled;AppServerBinRoot=$binRoot
+        }
+        Cached=$cached;Hash=(Get-FileHash -LiteralPath $bundled -Algorithm SHA256).Hash.ToUpperInvariant()
+    }
+}
+
+Describe 'Verified process shutdown handles' {
+    BeforeEach {
+        $script:verifiedProcessStarted=[DateTimeOffset]::Parse('2026-10-26T11:12:13.1234567+03:00')
+        $script:verifiedProcessPath='C:\WindowsApps\OpenAI.Codex_fixture\app\ChatGPT.exe'
+        $script:verifiedFreshProcess=[pscustomobject]@{
+            ProcessId=120;ExecutablePath=$script:verifiedProcessPath;CreationDate=$script:verifiedProcessStarted
+        }
+        $script:verifiedProcessHandle=New-TestProcessHandle -ProcessId 120 -StartTime $script:verifiedProcessStarted.UtcDateTime
+        Mock Get-CimInstance { $script:verifiedFreshProcess }
+        Mock Get-Process { $script:verifiedProcessHandle }
+    }
+
+    It 'verifies a Desktop root identity without optional app-server core fields' {
+        $identity=[ordered]@{
+            processId=120;startedUtc=$script:verifiedProcessStarted.ToString('o');executablePath=$script:verifiedProcessPath
+        }
+
+        $handle=Get-VerifiedCodexProcessHandle -Identity $identity
+
+        $handle | Should Not Be $null
+        $handle.Id | Should Be 120
+        $script:verifiedProcessHandle.SafeHandleState.Reads | Should Be 1
+        Assert-MockCalled Get-Process -Times 1 -Exactly -Scope It
+    }
+
+    It 'verifies a stock app-server identity with core fields' {
+        $identity=[ordered]@{
+            processId=120;startedUtc=$script:verifiedProcessStarted.ToString('o');executablePath=$script:verifiedProcessPath
+            coreKind='Stock';coreSha256=''
+        }
+
+        $handle=Get-VerifiedCodexProcessHandle -Identity $identity
+
+        $handle | Should Not Be $null
+        $handle.Id | Should Be 120
+    }
+
+    It 'rejects a reused PID with a different creation instant before opening a process handle' {
+        $script:verifiedFreshProcess.CreationDate=$script:verifiedProcessStarted.AddTicks(1)
+        $identity=[ordered]@{
+            processId=120;startedUtc=$script:verifiedProcessStarted.ToString('o');executablePath=$script:verifiedProcessPath
+        }
+
+        $handle=Get-VerifiedCodexProcessHandle -Identity $identity
+
+        $handle | Should Be $null
+        Assert-MockCalled Get-Process -Times 0 -Exactly -Scope It
+    }
+
+    It 'rejects and disposes a process wrapper whose retained OS handle is invalid' {
+        $script:verifiedProcessHandle.SafeHandleState.Value.IsInvalid=$true
+        $identity=[ordered]@{
+            processId=120;startedUtc=$script:verifiedProcessStarted.ToString('o');executablePath=$script:verifiedProcessPath
+        }
+
+        $handle=Get-VerifiedCodexProcessHandle -Identity $identity
+
+        $handle | Should Be $null
+        $script:verifiedProcessHandle.SafeHandleState.Reads | Should Be 1
+        $script:verifiedProcessHandle.SafeHandleState.Value.IsClosed | Should Be $true
+    }
+
+    It 'does not return from the real stop path while the captured Desktop root survives force-stop' {
+        $config=Get-WatchdogConfig
+        $config.GracefulShutdownSeconds=0
+        $config.ForceShutdownVerificationSeconds=0
+        $script:shutdownNow=[DateTimeOffset]::Parse('2026-10-26T11:12:13Z')
+        $desktopPath='C:\WindowsApps\OpenAI.Codex_fixture\app\ChatGPT.exe'
+        $stockPath='C:\WindowsApps\OpenAI.Codex_fixture\app\resources\codex.exe'
+        $desktopStart=$script:shutdownNow.AddMinutes(-2)
+        $serverStart=$script:shutdownNow.AddMinutes(-1)
+        $script:shutdownPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$desktopPath;AppServerExecutable=$stockPath
+        }
+        $selection=Get-CodexDesiredCoreIdentity -Package $script:shutdownPackage
+        $desktopIdentity=[ordered]@{
+            processId=20;startedUtc=$desktopStart.ToString('o');executablePath=$desktopPath
+        }
+        $serverIdentity=[ordered]@{
+            processId=21;startedUtc=$serverStart.ToString('o');executablePath=$stockPath
+            coreKind='Stock';coreSha256='';desktopProcessId=20;desktopStartedUtc=$desktopStart.ToString('o')
+        }
+        $script:shutdownProcess=[ordered]@{
+            DesktopPresent=$true;AppServerPresent=$true;AppServerStatus='Recognized';CoreSelection=$selection
+            SelectedCorePresent=$true;TrustedPreviousCorePresent=$false;CoreSwitchPending=$true
+            UnknownAppServerProcessIds=@();UnknownAppServerExecutables=@()
+            RootProcessIds=@(20);RootProcessIdentities=@($desktopIdentity)
+            AppServerProcessIds=@(21);AppServerProcessIdentities=@($serverIdentity)
+            AllPackageProcessIds=@(20,21)
+        }
+        $script:shutdownHandleActions=@{
+            20=[ordered]@{CloseCount=0;KillCount=0;CloseExits=$false;KillExits=$false;Exited=$false}
+            21=[ordered]@{CloseCount=0;KillCount=0;CloseExits=$false;KillExits=$false;Exited=$false}
+        }
+        $script:shutdownCim=@{
+            20=[pscustomobject]@{ProcessId=20;ExecutablePath=$desktopPath;CreationDate=$desktopStart}
+            21=[pscustomobject]@{ProcessId=21;ExecutablePath=$stockPath;CreationDate=$serverStart}
+        }
+        $script:shutdownVerificationSequence=@(
+            $script:shutdownCim[20],$script:shutdownCim[20],$script:shutdownCim[21],$script:shutdownCim[21],
+            $script:shutdownCim[20],$script:shutdownCim[20],$script:shutdownCim[21],$script:shutdownCim[21]
+        )
+        $script:shutdownVerificationIndex=0
+        $script:currentShutdownCim=$null
+        Mock Get-CodexPackageInfo { $script:shutdownPackage }
+        Mock Get-CodexProcessObservation { $script:shutdownProcess }
+        Mock Get-CimInstance {
+            $index=$script:shutdownVerificationIndex++
+            $script:currentShutdownCim=$script:shutdownVerificationSequence[$index % $script:shutdownVerificationSequence.Count]
+            if ($script:unverifyShutdownRoot -and $script:currentShutdownCim.ProcessId -eq 20) { return $null }
+            $script:currentShutdownCim
+        }
+        $script:unverifyShutdownRoot=$false
+        Mock Get-Process {
+            New-TestProcessHandle -ProcessId $script:currentShutdownCim.ProcessId -StartTime $script:currentShutdownCim.CreationDate.UtcDateTime
+        }
+        Mock Start-Sleep {}
+
+        $failure=$null
+        try {
+            Stop-CodexPackageProcesses -Package $script:shutdownPackage -Config $config -ExpectedCore $selection
+        } catch { $failure=$_ }
+
+        $failure.Exception.Message | Should Be 'Codex processes remained alive after the bounded shutdown attempt; refusing to launch another instance.'
+        $script:shutdownHandleActions[20].CloseCount | Should Be 1
+        $script:shutdownHandleActions[20].KillCount | Should Be 1
+        $script:shutdownHandleActions[21].KillCount | Should Be 1
+
+        $script:launchCalls=0
+        $script:selectorWrites=0
+        Mock Save-WatchdogState {}
+        Mock Write-DiagnosticSnapshot {}
+        Mock Write-WatchdogEvent {}
+        Mock Get-CodexDatabasePaths { [ordered]@{State='state';Logs='logs'} }
+        Mock Test-CodexDatabaseIntegrity { [ordered]@{Healthy=$true;State='ok';Logs='ok'} }
+        Mock Get-RemoteEnrollmentObservation { [ordered]@{Status='Enabled';EnabledCount=1} }
+        Mock Get-CodexDesktopLaunchPlan { [ordered]@{Mode='Enhanced';CanLaunch=$true} }
+        Mock Start-CodexDesktop { $script:launchCalls++ }
+        Mock Set-PersistedUserCodexSelection { $script:selectorWrites++ }
+        Mock Wait-CodexHealthyProcesses { throw 'Readiness cannot be reached after incomplete shutdown.' }
+        $recoveryObservation=[ordered]@{
+            Package=$script:shutdownPackage;Process=$script:shutdownProcess
+            Integrity=[ordered]@{Healthy=$true;State='ok';Logs='ok'}
+            Enrollment=[ordered]@{Status='Enabled';EnabledCount=1}
+            Remote=[ordered]@{ManualCondition=$false;ManualReason=''};Threads=@()
+        }
+        $decision=New-WatchdogDecision -Action Restart -Reason 'CoreSelectionChanged'
+        $recovery=Invoke-CodexRecovery -Mode Restart -Config $config -State (New-WatchdogState) `
+            -Observation $recoveryObservation -Decision $decision -Now $script:shutdownNow
+
+        $recovery.Successful | Should Be $false
+        $script:launchCalls | Should Be 0
+        $script:selectorWrites | Should Be 0
+        Assert-MockCalled Wait-CodexHealthyProcesses -Times 0 -Exactly -Scope It
+
+        $script:shutdownHandleActions[20].CloseCount=0
+        $script:shutdownHandleActions[20].KillCount=0
+        $script:shutdownHandleActions[21].KillCount=0
+        $script:unverifyShutdownRoot=$true
+        $script:shutdownVerificationIndex=0
+        $failure=$null
+        try {
+            Stop-CodexPackageProcesses -Package $script:shutdownPackage -Config $config -ExpectedCore $selection
+        } catch { $failure=$_ }
+        $failure.Exception.Message | Should Be 'Captured Codex process 20 is still present but its process handle could not be verified.'
+        $script:shutdownHandleActions[20].CloseCount | Should Be 0
+        $script:shutdownHandleActions[20].KillCount | Should Be 0
+        $script:shutdownHandleActions[21].KillCount | Should Be 0
+    }
+
+    It 'waits for a captured app-server orphan after the Desktop root exits and stops it by captured identity' {
+        $config=Get-WatchdogConfig
+        $config.GracefulShutdownSeconds=0
+        $config.ForceShutdownVerificationSeconds=0
+        $now=[DateTimeOffset]::Parse('2026-10-26T11:12:13Z')
+        $desktopPath='C:\WindowsApps\OpenAI.Codex_fixture\app\ChatGPT.exe'
+        $stockPath='C:\WindowsApps\OpenAI.Codex_fixture\app\resources\codex.exe'
+        $desktopStart=$now.AddMinutes(-2)
+        $serverStart=$now.AddMinutes(-1)
+        $script:shutdownPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$desktopPath;AppServerExecutable=$stockPath
+        }
+        $selection=Get-CodexDesiredCoreIdentity -Package $script:shutdownPackage
+        $desktopIdentity=[ordered]@{processId=20;startedUtc=$desktopStart.ToString('o');executablePath=$desktopPath}
+        $serverIdentity=[ordered]@{
+            processId=21;startedUtc=$serverStart.ToString('o');executablePath=$stockPath
+            coreKind='Stock';coreSha256='';desktopProcessId=20;desktopStartedUtc=$desktopStart.ToString('o')
+        }
+        $script:shutdownHandleActions=@{
+            20=[ordered]@{CloseCount=0;KillCount=0;CloseExits=$true;KillExits=$false;Exited=$false}
+            21=[ordered]@{CloseCount=0;KillCount=0;CloseExits=$false;KillExits=$true;Exited=$false}
+        }
+        $script:shutdownCim=@{
+            20=[pscustomobject]@{ProcessId=20;ExecutablePath=$desktopPath;CreationDate=$desktopStart}
+            21=[pscustomobject]@{ProcessId=21;ExecutablePath=$stockPath;CreationDate=$serverStart}
+        }
+        $script:shutdownVerificationSequence=@($script:shutdownCim[20],$script:shutdownCim[20],$script:shutdownCim[21],$script:shutdownCim[21],$script:shutdownCim[21],$script:shutdownCim[21])
+        $script:shutdownVerificationIndex=0
+        $script:currentShutdownCim=$null
+        $script:shutdownProcess=[ordered]@{
+            DesktopPresent=$true;AppServerPresent=$true;AppServerStatus='Recognized';CoreSelection=$selection
+            RootProcessIds=@(20);RootProcessIdentities=@($desktopIdentity)
+            AppServerProcessIds=@(21);AppServerProcessIdentities=@($serverIdentity)
+            AllPackageProcessIds=@(20,21)
+        }
+        Mock Get-CodexPackageInfo { $script:shutdownPackage }
+        Mock Get-CodexProcessObservation {
+            if ($script:shutdownHandleActions[20].Exited) {
+                return [ordered]@{
+                    DesktopPresent=$false;AppServerPresent=$false;AppServerStatus='Missing';CoreSelection=$selection
+                    RootProcessIds=@();RootProcessIdentities=@();AppServerProcessIds=@();AppServerProcessIdentities=@()
+                    AllPackageProcessIds=@()
+                }
+            }
+            return $script:shutdownProcess
+        }
+        Mock Get-CimInstance {
+            $index=$script:shutdownVerificationIndex++
+            $script:currentShutdownCim=$script:shutdownVerificationSequence[$index % $script:shutdownVerificationSequence.Count]
+            $script:currentShutdownCim
+        }
+        Mock Get-Process {
+            New-TestProcessHandle -ProcessId $script:currentShutdownCim.ProcessId -StartTime $script:currentShutdownCim.CreationDate.UtcDateTime
+        }
+        Mock Start-Sleep {}
+
+        Stop-CodexPackageProcesses -Package $script:shutdownPackage -Config $config -ExpectedCore $selection
+
+        $script:shutdownHandleActions[20].CloseCount | Should Be 1
+        $script:shutdownHandleActions[21].KillCount | Should Be 1
+        $script:shutdownHandleActions[21].Exited | Should Be $true
+    }
+}
+
 Describe 'Codex watchdog decision rules' {
     BeforeEach {
         $config = Get-WatchdogConfig
@@ -494,14 +789,29 @@ Describe 'Configured core recognition and safe uncertainty' {
     }
 
     It 'keeps stock and the exact configured legacy path recognized without accepting arbitrary versions' {
-        foreach($path in @($package.AppServerExecutable,$core)){
-            $server.ExecutablePath=$path
-            $recognized=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
-            $recognized.AppServerPresent | Should Be $true
-            $recognized.AppServerStatus | Should Be 'Recognized'
+        $server.ExecutablePath=$core
+        $legacy=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $legacy.AppServerPresent | Should Be $true
+        $legacy.AppServerStatus | Should Be 'Recognized'
+
+        $stockPackage=[ordered]@{
+            Found=$true;Version=$package.Version;DesktopExecutable=$package.DesktopExecutable
+            AppServerExecutable=$package.AppServerExecutable;AppServerBinRoot=$package.AppServerBinRoot
+            AppServerOverride=[ordered]@{Executable='';Source='None';Error=$null;Managed=$false;HashVerified=$true;Sha256=''}
         }
+        $server.ExecutablePath=$package.AppServerExecutable
+        $stock=Get-CodexProcessObservation -Package $stockPackage -Processes @($main,$server)
+        $stock.AppServerPresent | Should Be $true
+        $stock.SelectedCorePresent | Should Be $true
+        $stock.CoreSelection.Path | Should Be $package.AppServerExecutable
+
+        $server.ExecutablePath=$package.AppServerExecutable
+        $selectedOverride=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $selectedOverride.AppServerStatus | Should Be 'Unknown'
+        $selectedOverride.SelectedCorePresent | Should Be $false
+
         $server.ExecutablePath=Join-Path $package.AppServerBinRoot 'future-build\codex.exe'
-        $unconfigured=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $unconfigured=Get-CodexProcessObservation -Package $stockPackage -Processes @($main,$server)
         $unconfigured.AppServerStatus | Should Be 'Unknown'
     }
 
@@ -537,8 +847,10 @@ Describe 'Configured core recognition and safe uncertainty' {
         $nested=Get-CodexProcessObservation -Package $package -Processes @($main,$tool,$server)
         $nested.AppServerStatus | Should Be 'Missing'
         @($nested.UnknownAppServerProcessIds).Count | Should Be 0
-        $server.ParentProcessId=20
-        $unknownAlongsideKnown=Get-CodexProcessObservation -Package $package -Processes @($main,$server,([pscustomobject]@{ProcessId=22;ParentProcessId=20;Name='codex.exe';ExecutablePath=$core;CommandLine='codex.exe app-server'}))
+        $server.ParentProcessId=20;$server.ExecutablePath=$core
+        $unknownAlongsideKnown=Get-CodexProcessObservation -Package $package -Processes @($main,$server,([pscustomobject]@{
+            ProcessId=22;ParentProcessId=20;Name='codex.exe';ExecutablePath=$oldCore;CommandLine='codex.exe app-server';CreationDate=$now.AddMinutes(-18)
+        }))
         $unknownAlongsideKnown.AppServerPresent | Should Be $true
         $unknownAlongsideKnown.AppServerStatus | Should Be 'Unknown'
         $validation=Get-RecoveryValidationReport -BeforePackage $package -AfterPackage $package -Process $unknownAlongsideKnown -Integrity ([ordered]@{State='ok';Logs='ok'}) -Enrollment ([ordered]@{Status='Enabled';EnabledCount=1})
@@ -570,6 +882,176 @@ Describe 'Configured core recognition and safe uncertainty' {
         $confirmed=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now.AddMinutes(7)
         $confirmed.Action | Should Be 'Restart'
         $confirmed.Reason | Should Be 'AppServerMissing'
+    }
+}
+
+Describe 'Cached stock core identity' {
+    BeforeEach {
+        $fixture=New-StockCacheFixture -Root (Join-Path $TestDrive ('stock cache '+[guid]::NewGuid()))
+        $package=$fixture.Package
+        $now=[DateTimeOffset]::Parse('2026-10-26T12:00:00Z')
+        $main=[pscustomobject]@{
+            ProcessId=20;ParentProcessId=1;Name='ChatGPT.exe';ExecutablePath=$package.DesktopExecutable
+            CommandLine='desktop';CreationDate=$now.AddMinutes(-2)
+        }
+        $server=[pscustomobject]@{
+            ProcessId=21;ParentProcessId=20;Name='codex.exe';ExecutablePath=$fixture.Cached
+            CommandLine='codex.exe app-server --analytics-default-enabled';CreationDate=$now.AddMinutes(-1)
+        }
+    }
+
+    It 'accepts only the bundled core or a fixed-depth non-reparse cache copy matching its size and hash' {
+        (Test-CodexStockAppServerExecutablePath -Package $package -ExecutablePath $package.AppServerExecutable) | Should Be $true
+        (Test-CodexStockAppServerExecutablePath -Package $package -ExecutablePath $fixture.Cached) | Should Be $true
+
+        $shortHashPath=Join-Path $package.AppServerBinRoot '1234567890ABCDE\codex.exe'
+        $nestedPath=Join-Path $package.AppServerBinRoot 'nested\2993767bd1dfb009\codex.exe'
+        $null=New-Item -ItemType Directory -Path (Split-Path -Parent $shortHashPath),(Split-Path -Parent $nestedPath) -Force
+        [IO.File]::WriteAllText($shortHashPath,'fixture package stock core; never executed',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($nestedPath,'fixture package stock core; never executed',[Text.UTF8Encoding]::new($false))
+        (Test-CodexStockAppServerExecutablePath -Package $package -ExecutablePath $shortHashPath) | Should Be $false
+        (Test-CodexStockAppServerExecutablePath -Package $package -ExecutablePath $nestedPath) | Should Be $false
+
+        [IO.File]::WriteAllText($fixture.Cached,'tampered',[Text.UTF8Encoding]::new($false))
+        (Test-CodexStockAppServerExecutablePath -Package $package -ExecutablePath $fixture.Cached) | Should Be $false
+    }
+
+    It 'rejects a cache path with a reparse point and an app-server older than its Desktop parent' {
+        $script:reparseStockPath=$fixture.Cached
+        Mock Test-CodexPathHasReparsePoint { $true } -ParameterFilter { $Path -ieq $script:reparseStockPath }
+        (Test-CodexStockAppServerExecutablePath -Package $package -ExecutablePath $fixture.Cached) | Should Be $false
+
+        $script:reparseStockPath=$package.AppServerExecutable
+        Mock Test-CodexPathHasReparsePoint { [bool]($Path -ieq $script:reparseStockPath) }
+        (Test-CodexStockAppServerExecutablePath -Package $package -ExecutablePath $fixture.Cached) | Should Be $false
+
+        $server.CreationDate=$main.CreationDate.AddTicks(-1)
+        $olderChild=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $olderChild.AppServerStatus | Should Be 'Unknown'
+        $olderChild.SelectedCorePresent | Should Be $false
+    }
+
+    It 'recognizes the cached stock core only as a timestamp-bound previous process during a custom handover' {
+        $stockObservation=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $state=New-WatchdogState
+        $healthy=[ordered]@{
+            Package=$package;Process=$stockObservation;Integrity=[ordered]@{Healthy=$true}
+            Enrollment=[ordered]@{Status='Enabled'};Remote=[ordered]@{ManualCondition=$false}
+        }
+        (Set-LastHealthyCoreFromObservation -State $state -Observation $healthy -Now $now) | Should Be $true
+
+        $custom=New-ManagedCoreFixture -Root (Join-Path $TestDrive ('selected custom '+[guid]::NewGuid())) -Version 'future-custom'
+        $customPackage=[ordered]@{
+            Found=$true;Version=$package.Version;DesktopExecutable=$package.DesktopExecutable
+            AppServerExecutable=$package.AppServerExecutable;AppServerBinRoot=$package.AppServerBinRoot
+            AppServerOverride=[ordered]@{
+                Executable=$custom.Path;Source='User';Error=$null;Managed=$true;HashVerified=$true
+                MetadataValidated=$true;Sha256=$custom.Hash;Version=$custom.Version
+            }
+        }
+
+        $withoutSnapshot=Get-CodexProcessObservation -Package $customPackage -Processes @($main,$server)
+        $withoutSnapshot.AppServerStatus | Should Be 'Unknown'
+        $withoutSnapshot.SelectedCorePresent | Should Be $false
+
+        $handover=Get-CodexProcessObservation -Package $customPackage -Processes @($main,$server) -TrustedPreviousCore $state.lastHealthyCore
+        $handover.AppServerStatus | Should Be 'Recognized'
+        $handover.TrustedPreviousCorePresent | Should Be $true
+        $handover.SelectedCorePresent | Should Be $false
+        $handover.CoreSwitchPending | Should Be $true
+
+    }
+
+    It 'requires cached stock app servers to be direct Desktop children when selected or trusted previous' {
+        $stockObservation=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $state=New-WatchdogState
+        $healthy=[ordered]@{
+            Package=$package;Process=$stockObservation;Integrity=[ordered]@{Healthy=$true}
+            Enrollment=[ordered]@{Status='Enabled'};Remote=[ordered]@{ManualCondition=$false}
+        }
+        (Set-LastHealthyCoreFromObservation -State $state -Observation $healthy -Now $now) | Should Be $true
+
+        $nestedParent=[pscustomobject]@{
+            ProcessId=22;ParentProcessId=20;Name='codex.exe';ExecutablePath=(Join-Path $package.AppServerBinRoot 'tool\codex.exe')
+            CommandLine='codex.exe cli-tool';CreationDate=$now.AddSeconds(10)
+        }
+        $server.ParentProcessId=22
+        $nestedSelected=Get-CodexProcessObservation -Package $package -Processes @($main,$nestedParent,$server)
+        $nestedSelected.SelectedCorePresent | Should Be $false
+        $nestedSelected.AppServerStatus | Should Be 'Missing'
+
+        $custom=New-ManagedCoreFixture -Root (Join-Path $TestDrive ('nested custom '+[guid]::NewGuid())) -Version 'future-nested'
+        $customPackage=[ordered]@{
+            Found=$true;Version=$package.Version;DesktopExecutable=$package.DesktopExecutable
+            AppServerExecutable=$package.AppServerExecutable;AppServerBinRoot=$package.AppServerBinRoot
+            AppServerOverride=[ordered]@{
+                Executable=$custom.Path;Source='User';Error=$null;Managed=$true;HashVerified=$true
+                MetadataValidated=$true;Sha256=$custom.Hash;Version=$custom.Version
+            }
+        }
+        $nestedPrevious=Get-CodexProcessObservation -Package $customPackage -Processes @($main,$nestedParent,$server) `
+            -TrustedPreviousCore $state.lastHealthyCore
+        $nestedPrevious.TrustedPreviousCorePresent | Should Be $false
+        $nestedPrevious.AppServerStatus | Should Be 'Missing'
+    }
+
+    It 'keeps the canonical stock selection and readiness while the Desktop runs its verified cache copy' {
+        $selected=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $selected.AppServerStatus | Should Be 'Recognized'
+        $selected.SelectedCorePresent | Should Be $true
+        $selected.CoreSelection.Kind | Should Be 'Stock'
+        $selected.CoreSelection.Path | Should Be $package.AppServerExecutable
+        $selected.AppServerProcessIdentities[0].executablePath | Should Be $fixture.Cached
+
+        $state=New-WatchdogState
+        $healthy=[ordered]@{
+            Package=$package;Process=$selected;Integrity=[ordered]@{Healthy=$true}
+            Enrollment=[ordered]@{Status='Enabled'};Remote=[ordered]@{ManualCondition=$false}
+        }
+        (Set-LastHealthyCoreFromObservation -State $state -Observation $healthy -Now $now) | Should Be $true
+        $state.lastHealthyCore.core.path | Should Be $package.AppServerExecutable
+        $state.lastHealthyCore.process.executablePath | Should Be $fixture.Cached
+
+    }
+
+    It 'uses canonical stock selection for readiness and rejects cached stock as selected custom readiness' {
+        $stockSelection=Get-CodexDesiredCoreIdentity -Package $package
+        $stockObservation=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $state=New-WatchdogState
+        $healthy=[ordered]@{
+            Package=$package;Process=$stockObservation;Integrity=[ordered]@{Healthy=$true}
+            Enrollment=[ordered]@{Status='Enabled'};Remote=[ordered]@{ManualCondition=$false}
+        }
+        (Set-LastHealthyCoreFromObservation -State $state -Observation $healthy -Now $now) | Should Be $true
+
+        $custom=New-ManagedCoreFixture -Root (Join-Path $TestDrive ('readiness custom '+[guid]::NewGuid())) -Version 'future-readiness'
+        $customPackage=[ordered]@{
+            Found=$true;Version=$package.Version;DesktopExecutable=$package.DesktopExecutable
+            AppServerExecutable=$package.AppServerExecutable;AppServerBinRoot=$package.AppServerBinRoot
+            AppServerOverride=[ordered]@{
+                Executable=$custom.Path;Source='User';Error=$null;Managed=$true;HashVerified=$true
+                MetadataValidated=$true;Sha256=$custom.Hash;Version=$custom.Version
+            }
+        }
+        $customSelection=Get-CodexDesiredCoreIdentity -Package $customPackage
+        $handover=Get-CodexProcessObservation -Package $customPackage -Processes @($main,$server) -TrustedPreviousCore $state.lastHealthyCore
+        $handover.AppServerStatus | Should Be 'Recognized'
+        $handover.SelectedCorePresent | Should Be $false
+
+        $script:readinessPackage=$package
+        $script:readinessObservation=$stockObservation
+        Mock Start-Sleep {}
+        Mock Get-CodexPackageInfo { $script:readinessPackage }
+        Mock Get-CodexProcessObservation { $script:readinessObservation }
+        $stockReady=Wait-CodexHealthyProcesses -Config (Get-WatchdogConfig) -InitialPackage $package `
+            -TimeoutSeconds 0 -ExpectedCore $stockSelection
+        $stockReady.Ready | Should Be $true
+
+        $script:readinessPackage=$customPackage
+        $script:readinessObservation=$handover
+        $customReady=Wait-CodexHealthyProcesses -Config (Get-WatchdogConfig) -InitialPackage $customPackage `
+            -TimeoutSeconds 0 -ExpectedCore $customSelection -TrustedPreviousCore $state.lastHealthyCore
+        $customReady.Ready | Should Be $false
     }
 }
 
@@ -798,6 +1280,67 @@ Describe 'Managed core switching and rollback gates' {
         $decision.Reason | Should Be 'HealthyTaskProtectsSharedApp'
     }
 
+    It 'latches a failed handover against repeated missing-server recovery until healthy or selector change' {
+        $oldPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$desktop;AppServerExecutable=$stock
+            AppServerOverride=[ordered]@{Executable=$old.Path;Source='User';Error=$null;Managed=$true;HashVerified=$true;Sha256=$old.Hash;Version=$old.Version}
+        }
+        $oldSelection=Get-CodexDesiredCoreIdentity -Package $oldPackage
+        $state.coreSwitchAttempt=[ordered]@{
+            status='RollbackAttempted';target=[ordered]@{source='User';path=$new.Path;sha256=$new.Hash}
+        }
+        $state.appServerMissingSinceUtc=$now.AddMinutes(-20).ToString('o')
+        $state.appServerMissingChecks=20
+        $observation.Package=$oldPackage
+        $observation.Process=[ordered]@{
+            DesktopPresent=$true;AppServerPresent=$false;AppServerStatus='Missing';CoreSelection=$oldSelection
+            CoreSwitchPending=$false;AllPackageProcessIds=@(20)
+        }
+
+        $blocked=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+
+        $blocked.Action | Should Be 'Manual'
+        $blocked.Reason | Should Be 'CoreSwitchAttemptAlreadyUsed'
+        $state.appServerMissingSinceUtc | Should Be $null
+        $state.appServerMissingChecks | Should Be 0
+
+        $other=New-ManagedCoreFixture -Root (Join-Path $root 'user-selected-new-core') -Version 'future-user-choice'
+        $otherPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$desktop;AppServerExecutable=$stock
+            AppServerOverride=[ordered]@{Executable=$other.Path;Source='User';Error=$null;Managed=$true;HashVerified=$true;Sha256=$other.Hash;Version=$other.Version}
+        }
+        $observation.Package=$otherPackage
+        $observation.Process=[ordered]@{
+            DesktopPresent=$true;AppServerPresent=$false;AppServerStatus='Missing'
+            CoreSelection=(Get-CodexDesiredCoreIdentity -Package $otherPackage)
+            CoreSwitchPending=$true;AllPackageProcessIds=@(20)
+        }
+
+        $changed=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+
+        $state.coreSwitchAttempt | Should Be $null
+        $changed.Action | Should Be 'Restart'
+        $changed.Reason | Should Be 'CoreSelectionChanged'
+    }
+
+    It 'clears the failed handover latch after a fresh healthy selected-core observation' {
+        $newServer=[pscustomobject]@{
+            ProcessId=22;ParentProcessId=20;Name='codex.exe';ExecutablePath=$new.Path
+            CommandLine='codex.exe app-server';CreationDate=$now.AddMinutes(-1)
+        }
+        $selectedProcess=Get-CodexProcessObservation -Package $newPackage -Processes @($previous.Desktop,$newServer) -TrustedPreviousCore $state.lastHealthyCore
+        $selectedProcess.CoreSwitchPending | Should Be $false
+        $state.coreSwitchAttempt=[ordered]@{status='RollbackAttempted';target=[ordered]@{source='User';path=$new.Path;sha256=$new.Hash}}
+        $healthy=[ordered]@{
+            Package=$newPackage;Process=$selectedProcess
+            Integrity=[ordered]@{Healthy=$true};Enrollment=[ordered]@{Status='Enabled'}
+            Remote=[ordered]@{ManualCondition=$false}
+        }
+
+        (Set-LastHealthyCoreFromObservation -State $state -Observation $healthy -Now $now) | Should Be $true
+        $state.coreSwitchAttempt | Should Be $null
+    }
+
     It 'leaves a matching old server unknown and never looks up or kills it without the saved identity' {
         $script:untrustedOldServer=Get-CodexProcessObservation -Package $newPackage -Processes @($previous.Desktop,$previous.Server)
         $script:untrustedOldServer.AppServerStatus | Should Be 'Unknown'
@@ -873,7 +1416,7 @@ Describe 'Managed core switching and rollback gates' {
             AppServerOverride=[ordered]@{Executable=$old.Path;Source='User';Error=$null;Managed=$true;MetadataValidated=$true;HashVerified=$true;Sha256=$old.Hash;Version=$old.Version;MetadataPath=$old.ManifestPath}
         }
         $expected=Get-CodexDesiredCoreIdentity -Package $script:rollbackPackage
-        $serverIdentity=[ordered]@{classification='Selected';processId=31;startedUtc=$now.ToString('o');desktopProcessId=30;desktopStartedUtc=$now.ToString('o')}
+        $serverIdentity=[ordered]@{classification='Selected';processId=31;startedUtc=$now.ToString('o');executablePath=$old.Path;desktopProcessId=30;desktopStartedUtc=$now.ToString('o')}
         $script:rollbackProcess=[ordered]@{
             CoreSelection=$expected;DesktopPresent=$true;SelectedCorePresent=$true;TrustedPreviousCorePresent=$false
             AppServerStatus='Recognized';AppServerPresent=$true;CoreSwitchPending=$false;AllPackageProcessIds=@(30,31)

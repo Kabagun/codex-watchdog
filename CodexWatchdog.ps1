@@ -56,6 +56,7 @@ function Get-WatchdogConfig {
         StartupGraceMinutes           = 5
         RecoveryVerificationSeconds   = 60
         GracefulShutdownSeconds       = 15
+        ForceShutdownVerificationSeconds = 5
         FailedRecoveryCooldownMinutes = 10
         MaxAutomaticRecoveriesPerHour = 3
         RemoteFailureWindowMinutes    = 15
@@ -100,6 +101,18 @@ function Test-CodexUtcTimestampEqual {
         $leftUtc=ConvertTo-UtcDateTimeOffset -Value $Left
         $rightUtc=ConvertTo-UtcDateTimeOffset -Value $Right
         return [bool]($leftUtc.UtcDateTime.Ticks -eq $rightUtc.UtcDateTime.Ticks)
+    } catch { return $false }
+}
+
+function Test-CodexUtcTimestampAtOrAfter {
+    param($Left,$Right)
+
+    if ($null -eq $Left -or $null -eq $Right -or
+        [string]::IsNullOrWhiteSpace([string]$Left) -or [string]::IsNullOrWhiteSpace([string]$Right)) { return $false }
+    try {
+        $leftUtc=ConvertTo-UtcDateTimeOffset -Value $Left
+        $rightUtc=ConvertTo-UtcDateTimeOffset -Value $Right
+        return [bool]($leftUtc.UtcDateTime.Ticks -ge $rightUtc.UtcDateTime.Ticks)
     } catch { return $false }
 }
 
@@ -693,8 +706,38 @@ function Get-CodexRootAncestorId {
     return $null
 }
 
+function Test-CodexStockAppServerExecutablePath {
+    <# .SYNOPSIS Accepts the bundled stock core or its verified fixed-format cache copy. #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
+        [Parameter(Mandatory)][string]$ExecutablePath
+    )
+
+    try {
+        if (-not [IO.Path]::IsPathFullyQualified($ExecutablePath) -or
+            [IO.Path]::GetFileName($ExecutablePath) -ine 'codex.exe' -or -not $Package.AppServerExecutable) { return $false }
+        $candidatePath=[IO.Path]::GetFullPath($ExecutablePath)
+        $bundledPath=[IO.Path]::GetFullPath([string]$Package.AppServerExecutable)
+        if ($candidatePath -ieq $bundledPath) { return $true }
+
+        $binRoot=[string](Get-JsonPropertyValue -Object $Package -Name 'AppServerBinRoot')
+        if (-not $binRoot -or -not (Test-Path -LiteralPath $candidatePath -PathType Leaf) -or
+            (Test-CodexPathHasReparsePoint -Path $candidatePath)) { return $false }
+        $relative=[IO.Path]::GetRelativePath([IO.Path]::GetFullPath($binRoot),$candidatePath)
+        if ([IO.Path]::IsPathRooted($relative) -or $relative -notmatch '^[A-Fa-f0-9]{16}[\\/]codex\.exe$') { return $false }
+
+        $cacheFile=Get-Item -LiteralPath $candidatePath -Force -ErrorAction Stop
+        $bundledFile=Get-Item -LiteralPath $bundledPath -Force -ErrorAction Stop
+        if ($cacheFile.PSIsContainer -or $bundledFile.PSIsContainer -or $cacheFile.Length -le 0 -or $cacheFile.Length -ne $bundledFile.Length) { return $false }
+        if (Test-CodexPathHasReparsePoint -Path $bundledPath) { return $false }
+        $cacheHash=(Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        $bundledHash=(Get-FileHash -LiteralPath $bundledPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        return [bool]($cacheHash -ceq $bundledHash)
+    } catch { return $false }
+}
+
 function Test-CodexAppServerExecutablePath {
-    <# .SYNOPSIS Accepts the stock package core or the exact current persisted override. #>
+    <# .SYNOPSIS Accepts the current persisted override or stock core when stock is selected. #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
         [Parameter(Mandatory)][string]$ExecutablePath
@@ -706,13 +749,15 @@ function Test-CodexAppServerExecutablePath {
         if ([IO.Path]::GetFileName($candidatePath) -ine 'codex.exe') {
             return $false
         }
-        if ($Package.AppServerExecutable -and $candidatePath -ieq [IO.Path]::GetFullPath($Package.AppServerExecutable)) { return $true }
-        if (-not $Package.Contains('AppServerOverride') -or -not $Package.AppServerOverride.Executable -or
-            $Package.AppServerOverride.Error -or $candidatePath -ine $Package.AppServerOverride.Executable -or
+        $override=Get-JsonPropertyValue -Object $Package -Name 'AppServerOverride'
+        if ($override -and $override.Error) { return $false }
+        $overridePath=[string](Get-JsonPropertyValue -Object $override -Name 'Executable')
+        if (-not $overridePath) { return Test-CodexStockAppServerExecutablePath -Package $Package -ExecutablePath $candidatePath }
+        if ($candidatePath -ine $overridePath -or
             -not (Test-Path -LiteralPath $candidatePath -PathType Leaf) -or
             (Test-CodexPathHasReparsePoint -Path $candidatePath)) { return $false }
-        if ($Package.AppServerOverride.Managed) {
-            return [bool]($Package.AppServerOverride.MetadataValidated -and $Package.AppServerOverride.HashVerified)
+        if ($override.Managed) {
+            return [bool]($override.MetadataValidated -and $override.HashVerified)
         }
         # Compatibility for a directly selected, unmanaged exact path is retained,
         # but it is never eligible for automatic core-switch recovery.
@@ -830,30 +875,53 @@ function Get-CodexProcessObservation {
         $isDescendant = $rootIds.Count -gt 0 -and
             (Test-ProcessDescendsFrom -ProcessId ([int]$process.ParentProcessId) -AncestorIds $rootIds -ProcessById $processById)
         $hasServerRole = [string](Get-JsonPropertyValue -Object $process -Name 'CommandLine') -match '(?i)(?:^|\s)app-server(?:\s|$)'
-        $isSelected = $isDescendant -and $hasServerRole -and $process.ExecutablePath -and
-            (Test-CodexAppServerExecutablePath -Package $Package -ExecutablePath ([string]$process.ExecutablePath))
-        $isTrustedPrevious = $false
         $desktopAncestorId = if ($isDescendant) {
             Get-CodexRootAncestorId -ProcessId ([int]$process.ParentProcessId) -RootIds $rootIds -ProcessById $processById
         } else { $null }
         $desktopIdentity = $rootIdentities | Where-Object { [int]$_.processId -eq [int]$desktopAncestorId } | Select-Object -First 1
+        $serverStartedAfterDesktop = $desktopIdentity -and $processCreationDate -and
+            (Test-CodexUtcTimestampAtOrAfter -Left $processCreationDate -Right $desktopIdentity.startedUtc)
+        $isDescendant = [bool]($isDescendant -and $serverStartedAfterDesktop)
+        $isDirectDesktopChild = [bool]($desktopIdentity -and [int]$process.ParentProcessId -eq [int]$desktopIdentity.processId)
+        $isSelected = $isDescendant -and $hasServerRole -and $process.ExecutablePath -and
+            (Test-CodexAppServerExecutablePath -Package $Package -ExecutablePath ([string]$process.ExecutablePath))
+        $previousProcessPath = [string](Get-JsonPropertyValue -Object $previousProcessRecord -Name 'executablePath')
+        if (-not $previousProcessPath -and $previousCoreRecord) { $previousProcessPath = [string]$previousCoreRecord.path }
+        $isCachedStockPath = $false
+        if ($process.ExecutablePath -and $coreSelection.Kind -eq 'Stock') {
+            try {
+                $isCachedStockPath = [IO.Path]::GetFullPath([string]$process.ExecutablePath) -ine
+                    [IO.Path]::GetFullPath([string]$Package.AppServerExecutable)
+            } catch { $isCachedStockPath = $false }
+        }
+        if ($isSelected -and $isCachedStockPath -and -not $isDirectDesktopChild) { $isSelected = $false }
+        $isCachedPreviousStockPath = $false
+        if ($previousCoreRecord -and [string]$previousCoreRecord.kind -eq 'Stock' -and $previousProcessPath) {
+            try {
+                $isCachedPreviousStockPath = [IO.Path]::GetFullPath($previousProcessPath) -ine
+                    [IO.Path]::GetFullPath([string]$Package.AppServerExecutable)
+            } catch { $isCachedPreviousStockPath = $false }
+        }
+        $isTrustedPrevious = $false
         if (-not $isSelected -and $isDescendant -and $previousDiffersFromSelected -and $previousCoreRecord -and $previousProcessRecord -and
+            (-not $isCachedPreviousStockPath -or $isDirectDesktopChild) -and
             [int]$previousProcessRecord.pid -eq $processId -and
-            [string]$previousCoreRecord.path -and $process.ExecutablePath -ieq [string]$previousCoreRecord.path -and
+            $previousProcessPath -and $process.ExecutablePath -ieq $previousProcessPath -and
             $previousProcessRecord.startUtc -and $processCreationDate -and $desktopIdentity -and
             [int]$previousProcessRecord.desktopPid -eq [int]$desktopIdentity.processId -and
             (Test-CodexUtcTimestampEqual -Left $previousProcessRecord.desktopStartUtc -Right $desktopIdentity.startedUtc)) {
             try {
                 $isTrustedPrevious = Test-CodexUtcTimestampEqual -Left $processCreationDate -Right $previousProcessRecord.startUtc
                 if ($isTrustedPrevious -and [string]$previousCoreRecord.kind -eq 'Managed') {
-                    if (-not [string]$previousCoreRecord.sha256 -or (Test-CodexPathHasReparsePoint -Path ([string]$process.ExecutablePath))) {
+                    if (-not [string]$previousCoreRecord.sha256 -or $process.ExecutablePath -ine [string]$previousCoreRecord.path -or
+                        (Test-CodexPathHasReparsePoint -Path ([string]$process.ExecutablePath))) {
                         $isTrustedPrevious = $false
                     } else {
                         $actualPreviousHash = (Get-FileHash -LiteralPath ([string]$process.ExecutablePath) -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
                         $isTrustedPrevious = $actualPreviousHash -ceq ([string]$previousCoreRecord.sha256).ToUpperInvariant()
                     }
                 } elseif ($isTrustedPrevious -and [string]$previousCoreRecord.kind -eq 'Stock') {
-                    $isTrustedPrevious = $process.ExecutablePath -ieq [string]$previousCoreRecord.path
+                    $isTrustedPrevious = Test-CodexStockAppServerExecutablePath -Package $Package -ExecutablePath ([string]$process.ExecutablePath)
                 } else {
                     # A prior unmanaged exact override can still be recognized while
                     # selected, but it does not authorize an automatic core switch.
@@ -921,23 +989,54 @@ function Get-CodexProcessObservation {
 function Get-VerifiedCodexProcessHandle {
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Identity)
 
+    $handle = $null
     try {
-        $fresh = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$Identity.processId)" -ErrorAction Stop
-        if (-not $fresh -or [int]$fresh.ProcessId -ne [int]$Identity.processId -or
-            -not $fresh.ExecutablePath -or [string]$fresh.ExecutablePath -ine [string]$Identity.executablePath -or
-            -not $fresh.CreationDate -or (ConvertTo-UtcString $fresh.CreationDate) -cne [string]$Identity.startedUtc) { return $null }
-        if ([string]$Identity.coreKind -eq 'Managed') {
-            if (-not [string]$Identity.coreSha256 -or (Test-CodexPathHasReparsePoint -Path ([string]$Identity.executablePath)) -or
-                (Get-FileHash -LiteralPath ([string]$Identity.executablePath) -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant() -cne ([string]$Identity.coreSha256).ToUpperInvariant()) { return $null }
+        $processId = [int](Get-JsonPropertyValue -Object $Identity -Name 'processId')
+        $startedUtc = Get-JsonPropertyValue -Object $Identity -Name 'startedUtc'
+        $executablePath = [string](Get-JsonPropertyValue -Object $Identity -Name 'executablePath')
+        $coreKind = [string](Get-JsonPropertyValue -Object $Identity -Name 'coreKind')
+        $coreSha256 = [string](Get-JsonPropertyValue -Object $Identity -Name 'coreSha256')
+        if ($processId -le 0 -or -not $startedUtc -or -not $executablePath) { return $null }
+
+        $fresh = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
+        if (-not $fresh -or [int]$fresh.ProcessId -ne $processId -or
+            -not $fresh.ExecutablePath -or [string]$fresh.ExecutablePath -ine $executablePath -or
+            -not $fresh.CreationDate -or -not (Test-CodexUtcTimestampEqual -Left $fresh.CreationDate -Right $startedUtc)) { return $null }
+        if ($coreKind -eq 'Managed') {
+            if (-not $coreSha256 -or (Test-CodexPathHasReparsePoint -Path $executablePath) -or
+                (Get-FileHash -LiteralPath $executablePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant() -cne $coreSha256.ToUpperInvariant()) { return $null }
         }
-        $handle = Get-Process -Id ([int]$Identity.processId) -ErrorAction Stop
-        if (-not $handle.StartTime -or
-            [Math]::Abs(($handle.StartTime.ToUniversalTime() - (ConvertTo-UtcDateTimeOffset $Identity.startedUtc).UtcDateTime).TotalSeconds) -gt 2) {
+        $handle = Get-Process -Id $processId -ErrorAction Stop
+        $safeHandle = $handle.SafeHandle
+        if (-not $safeHandle -or $safeHandle.IsInvalid -or $safeHandle.IsClosed) {
             $handle.Dispose()
+            $handle = $null
+            return $null
+        }
+
+        $handleStartTime = $handle.StartTime
+        if (-not $handleStartTime -or
+            [Math]::Abs(($handleStartTime.ToUniversalTime() - (ConvertTo-UtcDateTimeOffset $startedUtc).UtcDateTime).TotalSeconds) -gt 2) {
+            $handle.Dispose()
+            $handle = $null
+            return $null
+        }
+
+        # Recheck the live PID after materializing the retained process handle.
+        # This closes the gap where it could exit and be reused between the first
+        # CIM lookup and Get-Process, while later actions use the same wrapper.
+        $freshAfterOpen = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
+        if (-not $freshAfterOpen -or [int]$freshAfterOpen.ProcessId -ne $processId -or
+            -not $freshAfterOpen.ExecutablePath -or [string]$freshAfterOpen.ExecutablePath -ine $executablePath -or
+            -not $freshAfterOpen.CreationDate -or
+            -not (Test-CodexUtcTimestampEqual -Left $freshAfterOpen.CreationDate -Right $startedUtc)) {
+            $handle.Dispose()
+            $handle = $null
             return $null
         }
         return $handle
     } catch {
+        if ($handle) { try { $handle.Dispose() } catch { } }
         return $null
     }
 }
@@ -988,6 +1087,170 @@ function Test-CodexCoreSelectionMatches {
     return [bool](-not $Actual.Managed -and ([string]$Actual.Sha256).ToUpperInvariant() -ceq ([string]$Expected.Sha256).ToUpperInvariant())
 }
 
+function Test-CodexCoreSelectionMatchesRecord {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Selection,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Record,
+        [string]$Source
+    )
+
+    $recordPath = [string](Get-JsonPropertyValue -Object $Record -Name 'path')
+    $recordHash = [string](Get-JsonPropertyValue -Object $Record -Name 'sha256')
+    $recordSource = [string](Get-JsonPropertyValue -Object $Record -Name 'source')
+    $recordKind = [string](Get-JsonPropertyValue -Object $Record -Name 'kind')
+    if (-not $recordPath -or [string]$Selection.Path -ine $recordPath -or
+        ([string]$Selection.Sha256).ToUpperInvariant() -cne $recordHash.ToUpperInvariant()) { return $false }
+    if ($recordSource -and [string]$Selection.Source -cne $recordSource) { return $false }
+    if ($Source -and [string]$Selection.Source -cne $Source) { return $false }
+    if ($recordKind -and [string]$Selection.Kind -cne $recordKind) { return $false }
+    return $true
+}
+
+function Assert-CodexShutdownProcessSet {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$CapturedByProcessId
+    )
+
+    if ($Observation.AppServerStatus -eq 'Unknown') {
+        throw 'An unrecognized live Codex app-server appeared during shutdown.'
+    }
+
+    $currentIdentities = @($Observation.RootProcessIdentities) + @($Observation.AppServerProcessIdentities)
+    if ($currentIdentities.Count -ne @($Observation.AllPackageProcessIds).Count) {
+        throw 'A live Codex process no longer has a complete verified identity; refusing to launch another instance.'
+    }
+    foreach ($identity in $currentIdentities) {
+        $processId = [int](Get-JsonPropertyValue -Object $identity -Name 'processId')
+        if (-not $CapturedByProcessId.Contains($processId)) {
+            throw 'A new Codex process appeared during shutdown; refusing to launch another instance.'
+        }
+        $captured = $CapturedByProcessId[$processId]
+        if (-not (Test-CodexUtcTimestampEqual -Left (Get-JsonPropertyValue -Object $identity -Name 'startedUtc') -Right (Get-JsonPropertyValue -Object $captured -Name 'startedUtc')) -or
+            [string](Get-JsonPropertyValue -Object $identity -Name 'executablePath') -ine [string](Get-JsonPropertyValue -Object $captured -Name 'executablePath')) {
+            throw 'A Codex process identity changed during shutdown; refusing to act on a reused process ID.'
+        }
+    }
+    return [bool](@($Observation.AllPackageProcessIds).Count -eq 0)
+}
+
+function Get-VerifiedCodexShutdownHandles {
+    param(
+        [Parameter(Mandatory)][object[]]$Identities,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$CapturedByProcessId,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [System.Collections.IDictionary]$TrustedPreviousCore,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$ExpectedCore
+    )
+
+    $handles=@()
+    try {
+        $package=Get-CodexPackageInfo -Config $Config
+        if (-not $package.Found) { throw 'Codex disappeared before process handles could be verified.' }
+        if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $package) -Expected $ExpectedCore)) {
+            throw 'The persisted core selection changed before process handles could be verified.'
+        }
+        $observation=Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
+        $null=Assert-CodexShutdownProcessSet -Observation $observation -CapturedByProcessId $CapturedByProcessId
+        $currentIds=@($observation.AllPackageProcessIds | ForEach-Object { [int]$_ })
+
+        foreach ($identity in $Identities) {
+            $processId=[int](Get-JsonPropertyValue -Object $identity -Name 'processId')
+            if ($processId -notin $currentIds) { continue }
+            $freshIdentity=Get-FreshSafeCodexProcessIdentity -Identity $identity -Config $Config `
+                -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
+            if (-not $freshIdentity) {
+                throw "Captured Codex process $processId is still present but no longer has a verified identity."
+            }
+            $process=Get-VerifiedCodexProcessHandle -Identity $freshIdentity
+            if (-not $process) {
+                throw "Captured Codex process $processId is still present but its process handle could not be verified."
+            }
+            $handles+=,[pscustomobject]@{Identity=$freshIdentity;Process=$process}
+        }
+
+        $package=Get-CodexPackageInfo -Config $Config
+        if (-not $package.Found) { throw 'Codex disappeared during process-handle verification.' }
+        if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $package) -Expected $ExpectedCore)) {
+            throw 'The persisted core selection changed during process-handle verification.'
+        }
+        $observation=Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
+        $null=Assert-CodexShutdownProcessSet -Observation $observation -CapturedByProcessId $CapturedByProcessId
+        $currentIds=@($observation.AllPackageProcessIds | ForEach-Object { [int]$_ })
+
+        $activeHandles=@()
+        foreach ($record in $handles) {
+            $processId=[int](Get-JsonPropertyValue -Object $record.Identity -Name 'processId')
+            $hasExited=[bool]$record.Process.HasExited
+            if ($processId -in $currentIds -and -not $hasExited) {
+                $activeHandles+=,$record
+            } elseif (-not $hasExited) {
+                throw "Captured Codex process $processId is absent from the fresh process list but its verified handle is still running."
+            } else {
+                $record.Process.Dispose()
+            }
+        }
+        return $activeHandles
+    } catch {
+        foreach ($record in $handles) { if ($record.Process) { $record.Process.Dispose() } }
+        throw
+    }
+}
+
+function Test-CodexShutdownHandlesExited {
+    param([Parameter(Mandatory)][object[]]$Handles)
+    foreach ($record in $Handles) {
+        try { if (-not $record.Process.HasExited) { return $false } }
+        catch { return $false }
+    }
+    return $true
+}
+
+function Get-VerifiedCapturedCodexProcessHandles {
+    param(
+        [Parameter(Mandatory)][object[]]$CapturedHandles,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$CapturedByProcessId,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$ExpectedCore,
+        [System.Collections.IDictionary]$TrustedPreviousCore
+    )
+
+    $handles=@()
+    try {
+        $package=Get-CodexPackageInfo -Config $Config
+        if (-not $package.Found) { throw 'Codex disappeared before force-stop.' }
+        if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $package) -Expected $ExpectedCore)) {
+            throw 'The persisted core selection changed before force-stop.'
+        }
+        $observation=Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
+        $null=Assert-CodexShutdownProcessSet -Observation $observation -CapturedByProcessId $CapturedByProcessId
+
+        foreach ($captured in $CapturedHandles) {
+            $processId=[int](Get-JsonPropertyValue -Object $captured.Identity -Name 'processId')
+            if ($captured.Process.HasExited) { continue }
+            $process=Get-VerifiedCodexProcessHandle -Identity $captured.Identity
+            if (-not $process) {
+                if ($captured.Process.HasExited) { continue }
+                throw "Captured Codex process $processId is still alive but its verified process handle could not be reacquired."
+            }
+            if ($process.HasExited) { $process.Dispose(); continue }
+            $handles+=,[pscustomobject]@{Identity=$captured.Identity;Process=$process}
+        }
+
+        $package=Get-CodexPackageInfo -Config $Config
+        if (-not $package.Found) { throw 'Codex disappeared during force-stop preflight.' }
+        if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $package) -Expected $ExpectedCore)) {
+            throw 'The persisted core selection changed during force-stop preflight.'
+        }
+        $observation=Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
+        $null=Assert-CodexShutdownProcessSet -Observation $observation -CapturedByProcessId $CapturedByProcessId
+        return $handles
+    } catch {
+        foreach ($record in $handles) { if ($record.Process) { $record.Process.Dispose() } }
+        throw
+    }
+}
+
 function Set-LastHealthyCoreFromObservation {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$State,
@@ -1025,15 +1288,16 @@ function Set-LastHealthyCoreFromObservation {
         process = [ordered]@{
             pid = [int]$active[0].processId
             startUtc = [string]$active[0].startedUtc
+            executablePath = [string]$active[0].executablePath
             desktopPid = [int]$active[0].desktopProcessId
             desktopStartUtc = [string]$active[0].desktopStartedUtc
         }
         healthyAtUtc = $Now.ToString('o')
     }
 
-    $attempt = $State.coreSwitchAttempt
-    if ($attempt -and $attempt.target -and [string]$attempt.target.path -ieq [string]$selection.Path -and
-        ([string]$attempt.target.sha256).ToUpperInvariant() -ceq ([string]$selection.Sha256).ToUpperInvariant()) {
+    if ($State.coreSwitchAttempt) {
+        # A freshly verified healthy app-server clears a failed handover latch,
+        # including when recovery had to return to the last healthy selector.
         $State.coreSwitchAttempt = $null
     }
     return $true
@@ -1699,6 +1963,24 @@ function Get-WatchdogDecision {
         return New-WatchdogDecision -Action 'Manual' -Reason "RemoteAuthentication:$($Observation.Remote.ManualReason)"
     }
 
+    $currentSelection = Get-JsonPropertyValue -Object $Observation.Process -Name 'CoreSelection'
+    if ($State.coreSwitchAttempt -and $currentSelection) {
+        $attemptTarget = Get-JsonPropertyValue -Object $State.coreSwitchAttempt -Name 'target'
+        $attemptStillApplies = $attemptTarget -and
+            (Test-CodexCoreSelectionMatchesRecord -Selection $currentSelection -Record $attemptTarget)
+        $lastHealthyStillApplies = $false
+        $lastHealthyCore = Get-JsonPropertyValue -Object $State.lastHealthyCore -Name 'core'
+        if ($lastHealthyCore) {
+            $lastHealthySelector = Get-JsonPropertyValue -Object $State.lastHealthyCore -Name 'selector'
+            $lastHealthyStillApplies = Test-CodexCoreSelectionMatchesRecord -Selection $currentSelection `
+                -Record $lastHealthyCore -Source ([string](Get-JsonPropertyValue -Object $lastHealthySelector -Name 'source'))
+        }
+        if (-not $attemptStillApplies -and -not $lastHealthyStillApplies) {
+            # A changed persisted selector is a new, explicit recovery choice.
+            $State.coreSwitchAttempt = $null
+        }
+    }
+
     if (-not $Observation.Process.DesktopPresent) {
         $State.appServerMissingSinceUtc = $null
         $State.appServerMissingChecks = 0
@@ -1743,6 +2025,11 @@ function Get-WatchdogDecision {
         return New-WatchdogDecision -Action 'Restart' -Reason 'CoreSelectionChanged'
     }
     if (-not $Observation.Process.AppServerPresent) {
+        if ($State.coreSwitchAttempt -and [string](Get-JsonPropertyValue -Object $State.coreSwitchAttempt -Name 'status') -in @('Failed','RollbackAttempted')) {
+            $State.appServerMissingSinceUtc = $null
+            $State.appServerMissingChecks = 0
+            return New-WatchdogDecision -Action 'Manual' -Reason 'CoreSwitchAttemptAlreadyUsed'
+        }
         if (-not $State.appServerMissingSinceUtc) {
             $State.appServerMissingSinceUtc = $Now.ToString('o')
             $State.appServerMissingChecks = 1
@@ -2018,50 +2305,78 @@ function Stop-CodexPackageProcesses {
     if (-not $ExpectedCore) { $ExpectedCore = Get-CodexDesiredCoreIdentity -Package $Package }
     $observation = Get-CodexProcessObservation -Package $Package -TrustedPreviousCore $TrustedPreviousCore
     if ($observation.AppServerStatus -eq 'Unknown') { throw 'An unrecognized live Codex app-server was found; refusing to close or stop the application.' }
-    foreach ($identity in @($observation.RootProcessIdentities)) {
-        $freshIdentity = Get-FreshSafeCodexProcessIdentity -Identity $identity -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
-        if ($freshIdentity) {
-            $process = Get-VerifiedCodexProcessHandle -Identity $freshIdentity
-            if ($process) {
-                try {
-                    $stillSafe = Get-FreshSafeCodexProcessIdentity -Identity $freshIdentity -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
-                    if ($stillSafe) { [void]$process.CloseMainWindow() }
-                } finally { $process.Dispose() }
-            }
+
+    $capturedIdentities = @($observation.RootProcessIdentities) + @($observation.AppServerProcessIdentities)
+    $capturedByProcessId = @{}
+    foreach ($identity in $capturedIdentities) {
+        $processId = [int](Get-JsonPropertyValue -Object $identity -Name 'processId')
+        $startedUtc = Get-JsonPropertyValue -Object $identity -Name 'startedUtc'
+        $executablePath = [string](Get-JsonPropertyValue -Object $identity -Name 'executablePath')
+        if ($processId -le 0 -or -not $startedUtc -or -not $executablePath -or $capturedByProcessId.Contains($processId)) {
+            throw 'A live Codex process lacks a unique, complete identity; refusing to close or stop it.'
         }
+        $capturedByProcessId[$processId] = $identity
+    }
+    if ($capturedByProcessId.Count -ne @($observation.AllPackageProcessIds).Count) {
+        throw 'The live Codex process set could not be captured completely; refusing to close or stop it.'
     }
 
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($Config.GracefulShutdownSeconds)
-    do {
-        Start-Sleep -Milliseconds 500
+    $rootProcessIds=@($observation.RootProcessIds | ForEach-Object { [int]$_ })
+    $capturedHandles=@(Get-VerifiedCodexShutdownHandles -Identities $capturedIdentities -CapturedByProcessId $capturedByProcessId `
+        -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore)
+    try {
+        foreach ($record in $capturedHandles) {
+            $processId=[int](Get-JsonPropertyValue -Object $record.Identity -Name 'processId')
+            if ($processId -in $rootProcessIds -and -not $record.Process.HasExited) { [void]$record.Process.CloseMainWindow() }
+        }
+
+        $deadline = [DateTimeOffset]::UtcNow.AddSeconds($Config.GracefulShutdownSeconds)
+        do {
+            Start-Sleep -Milliseconds 500
+            $livePackage = Get-CodexPackageInfo -Config $Config
+            if (-not $livePackage.Found) { throw 'Codex disappeared before shutdown completed.' }
+            if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $livePackage) -Expected $ExpectedCore)) {
+                throw 'The persisted core selection changed during shutdown.'
+            }
+            $remaining = Get-CodexProcessObservation -Package $livePackage -TrustedPreviousCore $TrustedPreviousCore
+            $processSetEmpty=Assert-CodexShutdownProcessSet -Observation $remaining -CapturedByProcessId $capturedByProcessId
+            if ($processSetEmpty -and (Test-CodexShutdownHandlesExited -Handles $capturedHandles)) { return }
+        } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
         $livePackage = Get-CodexPackageInfo -Config $Config
-        if (-not $livePackage.Found) { throw 'Codex disappeared before shutdown completed.' }
+        if (-not $livePackage.Found) { throw 'Codex disappeared before force-stop.' }
         if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $livePackage) -Expected $ExpectedCore)) {
-            throw 'The persisted core selection changed during shutdown.'
+            throw 'The persisted core selection changed before force-stop.'
         }
         $remaining = Get-CodexProcessObservation -Package $livePackage -TrustedPreviousCore $TrustedPreviousCore
-        if ($remaining.AllPackageProcessIds.Count -eq 0) { return }
-    } while ([DateTimeOffset]::UtcNow -lt $deadline)
-
-    $livePackage = Get-CodexPackageInfo -Config $Config
-    if (-not $livePackage.Found) { throw 'Codex disappeared before force-stop.' }
-    if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $livePackage) -Expected $ExpectedCore)) {
-        throw 'The persisted core selection changed before force-stop.'
-    }
-    $remaining = Get-CodexProcessObservation -Package $livePackage -TrustedPreviousCore $TrustedPreviousCore
-    if ($remaining.AppServerStatus -eq 'Unknown') { throw 'An unrecognized live Codex app-server appeared; refusing to force-stop the application.' }
-    $killIdentities = @($remaining.RootProcessIdentities) + @($remaining.AppServerProcessIdentities)
-    foreach ($identity in $killIdentities) {
-        $freshIdentity = Get-FreshSafeCodexProcessIdentity -Identity $identity -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
-        if ($freshIdentity) {
-            $process = Get-VerifiedCodexProcessHandle -Identity $freshIdentity
-            if ($process) {
-                try {
-                    $stillSafe = Get-FreshSafeCodexProcessIdentity -Identity $freshIdentity -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
-                    if ($stillSafe) { $process.Kill() }
-                } catch { } finally { $process.Dispose() }
+        $null=Assert-CodexShutdownProcessSet -Observation $remaining -CapturedByProcessId $capturedByProcessId
+        $killHandles=@(Get-VerifiedCapturedCodexProcessHandles -CapturedHandles $capturedHandles `
+            -CapturedByProcessId $capturedByProcessId -Config $Config -ExpectedCore $ExpectedCore -TrustedPreviousCore $TrustedPreviousCore)
+        try {
+            foreach ($record in $killHandles) {
+                try { $record.Process.Kill() } catch { }
             }
+        } finally {
+            foreach ($record in $killHandles) { $record.Process.Dispose() }
         }
+
+        $verificationSeconds = [int](Get-JsonPropertyValue -Object $Config -Name 'ForceShutdownVerificationSeconds')
+        $forceDeadline = [DateTimeOffset]::UtcNow.AddSeconds([Math]::Max(0,$verificationSeconds))
+        do {
+            Start-Sleep -Milliseconds 250
+            $livePackage = Get-CodexPackageInfo -Config $Config
+            if (-not $livePackage.Found) { throw 'Codex disappeared before shutdown could be verified.' }
+            if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $livePackage) -Expected $ExpectedCore)) {
+                throw 'The persisted core selection changed before shutdown could be verified.'
+            }
+            $remaining = Get-CodexProcessObservation -Package $livePackage -TrustedPreviousCore $TrustedPreviousCore
+            $processSetEmpty=Assert-CodexShutdownProcessSet -Observation $remaining -CapturedByProcessId $capturedByProcessId
+            if ($processSetEmpty -and (Test-CodexShutdownHandlesExited -Handles $capturedHandles)) { return }
+        } while ([DateTimeOffset]::UtcNow -lt $forceDeadline)
+
+        throw 'Codex processes remained alive after the bounded shutdown attempt; refusing to launch another instance.'
+    } finally {
+        foreach ($record in $capturedHandles) { $record.Process.Dispose() }
     }
 }
 
