@@ -2385,6 +2385,7 @@ function Get-CodexDesktopHandshakeObservation {
     <# .SYNOPSIS Verifies a current Desktop PID's successful stdio initialization handshake without exposing log text. #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [System.Collections.IDictionary]$Package,
         [object[]]$RootProcessIdentities = @(),
         [int[]]$RequiredProcessIds = @()
     )
@@ -2393,16 +2394,43 @@ function Get-CodexDesktopHandshakeObservation {
     $examinedFileCount=0
     $matchingFileCount=0
     $readErrorCount=0
+    $defaultLogsRoot=Join-Path $env:LOCALAPPDATA 'Codex\Logs'
     $logsRoot=[string](Get-JsonPropertyValue -Object $Config -Name 'DesktopLogsRoot')
-    if(-not $logsRoot){$logsRoot=Join-Path $env:LOCALAPPDATA 'Codex\Logs'}
+    if(-not $logsRoot){$logsRoot=$defaultLogsRoot}
+    $usesDefaultLogsRoot=$false
+    try{$usesDefaultLogsRoot=[IO.Path]::GetFullPath($logsRoot).TrimEnd('\','/') -ieq [IO.Path]::GetFullPath($defaultLogsRoot).TrimEnd('\','/')}catch{}
+    $logRootCandidates=[System.Collections.Generic.List[object]]::new()
+    $logRootCandidates.Add([ordered]@{Path=$logsRoot;Kind=if($usesDefaultLogsRoot){'Default'}else{'Configured'}})
+    # Packaged Codex redirects this LocalAppData path into its package cache.
+    # The unpackaged scheduled watchdog must also use the explicit physical path.
+    $packageFamily=[string](Get-JsonPropertyValue -Object $Package -Name 'PackageFamilyName')
+    $packageFamilyValidated=[bool]((Get-JsonPropertyValue -Object $Package -Name 'Found') -and
+        $packageFamily -cmatch '^[A-Za-z0-9][A-Za-z0-9.-]{2,49}_[A-Za-z0-9]{13}$')
+    if($usesDefaultLogsRoot -and $packageFamilyValidated){
+        $packageCacheRoot=Join-Path $env:LOCALAPPDATA (Join-Path 'Packages' (Join-Path $packageFamily 'LocalCache\Local\Codex\Logs'))
+        $logRootCandidates.Add([ordered]@{Path=$packageCacheRoot;Kind='PackageLocalCache'})
+    }
     $roots=@($RootProcessIdentities | Where-Object {
         [int](Get-JsonPropertyValue -Object $_ -Name 'processId') -gt 0
     })
     $rootIdentityChecks=[System.Collections.Generic.List[object]]::new()
+    $logRootChecks=[System.Collections.Generic.List[object]]::new()
+    foreach($logRootCandidate in $logRootCandidates){
+        $rootEvidence=[ordered]@{
+            Kind=$logRootCandidate.Kind;Available=(Test-Path -LiteralPath $logRootCandidate.Path -PathType Container)
+            SearchedDirectoryCount=0;ExistingDirectoryCount=0;DirectoryReadErrorCount=0
+            MatchingFileCount=0;ExaminedFileCount=0;VerifiedProcessIds=@()
+        }
+        $logRootChecks.Add($rootEvidence)
+        $logRootCandidate['Evidence']=$rootEvidence
+        $logRootCandidate['SearchedPaths']=[System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $logRootCandidate['ExistingPaths']=[System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    }
     $evidence=[ordered]@{
         RootProcessCount=@($RootProcessIdentities).Count
         InvalidRootCount=@($RootProcessIdentities).Count-$roots.Count
         RootIdentityChecks=$rootIdentityChecks
+        UsesDefaultLogsRoot=$usesDefaultLogsRoot;PackageFamilyValidated=$packageFamilyValidated;LogRoots=$logRootChecks
         SearchedDirectoryCount=0;ExistingDirectoryCount=0;DirectoryReadErrorCount=0;MatchingFileCount=0
     }
     foreach($invalidRoot in @($RootProcessIdentities | Where-Object {
@@ -2418,7 +2446,7 @@ function Get-CodexDesktopHandshakeObservation {
     $requiredIds=@($RequiredProcessIds | ForEach-Object {[int]$_} | Where-Object {$_ -gt 0} | Select-Object -Unique)
     $checkedAtUtc=[DateTimeOffset]::UtcNow.ToString('o')
 
-    if(-not (Test-Path -LiteralPath $logsRoot -PathType Container)){
+    if(@($logRootChecks | Where-Object Available).Count -eq 0){
         return [ordered]@{
             Verified=$false;Status='LogsRootUnavailable';VerifiedProcessIds=@();RequiredProcessIds=$requiredIds
             AllRequiredProcessesVerified=$false;ExaminedFileCount=0;ReadErrorCount=0;CheckedAtUtc=$checkedAtUtc
@@ -2466,27 +2494,43 @@ function Get-CodexDesktopHandshakeObservation {
         }catch{$rootCheck.Status='StartTimeInvalid';$evidence.InvalidRootCount++;continue}
 
         $dateDirectories=[System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $rootByDatePath=@{}
         foreach($baseDate in @($rootStartedUtc.UtcDateTime.Date,$rootStartedUtc.ToLocalTime().Date)){
             foreach($dayOffset in @(-1,0,1)){
                 $candidateDate=$baseDate.AddDays($dayOffset)
-                $datePath=Join-Path $logsRoot (Join-Path $candidateDate.ToString('yyyy') (Join-Path $candidateDate.ToString('MM') $candidateDate.ToString('dd')))
-                $null=$dateDirectories.Add($datePath)
+                foreach($logRootCandidate in $logRootCandidates){
+                    if(-not $logRootCandidate.Evidence.Available){continue}
+                    $datePath=Join-Path $logRootCandidate.Path (Join-Path $candidateDate.ToString('yyyy') (Join-Path $candidateDate.ToString('MM') $candidateDate.ToString('dd')))
+                    $null=$dateDirectories.Add($datePath)
+                    $rootByDatePath[$datePath]=$logRootCandidate
+                }
             }
         }
 
         $pidFilePattern='(?i)^codex-desktop-.+-'+[Regex]::Escape([string]$processId)+'-t\d+-i\d+-\d+-\d+\.log$'
         $matchingFiles=[System.Collections.Generic.List[System.IO.FileInfo]]::new()
+        $rootEvidenceByFile=@{}
         foreach($dateDirectory in $dateDirectories){
+            $logRootCandidate=$rootByDatePath[$dateDirectory]
+            $rootEvidence=$logRootCandidate.Evidence
             $null=$searchedDirectoryPaths.Add($dateDirectory)
             $evidence.SearchedDirectoryCount=$searchedDirectoryPaths.Count
+            $null=$logRootCandidate.SearchedPaths.Add($dateDirectory)
+            $rootEvidence.SearchedDirectoryCount=$logRootCandidate.SearchedPaths.Count
             if(-not (Test-Path -LiteralPath $dateDirectory -PathType Container)){continue}
             $null=$existingDirectoryPaths.Add($dateDirectory)
             $evidence.ExistingDirectoryCount=$existingDirectoryPaths.Count
+            $null=$logRootCandidate.ExistingPaths.Add($dateDirectory)
+            $rootEvidence.ExistingDirectoryCount=$logRootCandidate.ExistingPaths.Count
             try{
                 $dateFiles=@(Get-ChildItem -LiteralPath $dateDirectory -Filter 'codex-desktop-*.log' -File -Force -ErrorAction Stop |
                     Where-Object {$_.Name -match $pidFilePattern})
-                foreach($dateFile in $dateFiles){$matchingFiles.Add($dateFile)}
-            }catch{$readErrorCount++;$evidence.DirectoryReadErrorCount++}
+                foreach($dateFile in $dateFiles){
+                    $matchingFiles.Add($dateFile)
+                    $rootEvidenceByFile[$dateFile.FullName]=$rootEvidence
+                    $rootEvidence.MatchingFileCount++
+                }
+            }catch{$readErrorCount++;$evidence.DirectoryReadErrorCount++;$rootEvidence.DirectoryReadErrorCount++}
         }
         $orderedFiles=@($matchingFiles | Sort-Object LastWriteTimeUtc,FullName)
         $matchingFileCount+=$orderedFiles.Count
@@ -2497,11 +2541,13 @@ function Get-CodexDesktopHandshakeObservation {
         }else{$candidateFiles=$orderedFiles}
 
         foreach($candidateFile in $candidateFiles){
+            $rootEvidence=$rootEvidenceByFile[$candidateFile.FullName]
             $stream=$null
             try{
                 $share=[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
                 $stream=[IO.FileStream]::new($candidateFile.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,$share)
                 $examinedFileCount++
+                $rootEvidence.ExaminedFileCount++
                 $fileLength=$stream.Length
                 $segments=@(
                     [ordered]@{Offset=[long]0;Length=[long][Math]::Min($headByteLimit,$fileLength)}
@@ -2548,6 +2594,7 @@ function Get-CodexDesktopHandshakeObservation {
                                 $transportMatch.Groups['value'].Value -cne 'stdio'){continue}
                             try{$handshakeUtc=ConvertTo-UtcDateTimeOffset $eventMatch.Groups['timestamp'].Value}catch{continue}
                             if($handshakeUtc -lt $rootStartedUtc){continue}
+                            if($processId -notin $rootEvidence.VerifiedProcessIds){$rootEvidence.VerifiedProcessIds+=@($processId)}
                             if(-not $verifiedByProcessId.ContainsKey($processId) -or
                                 $handshakeUtc -gt $verifiedByProcessId[$processId]){$verifiedByProcessId[$processId]=$handshakeUtc}
                         }
@@ -2599,7 +2646,7 @@ function Wait-CodexHealthyProcesses {
                 [string](Get-JsonPropertyValue -Object $_ -Name 'classification') -ne 'TrustedPrevious' -and
                 [int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId') -gt 0
             } | ForEach-Object {[int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId')} | Select-Object -Unique)
-            $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config `
+            $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config -Package $package `
                 -RootProcessIdentities @(Get-JsonPropertyValue -Object $process -Name 'RootProcessIdentities') `
                 -RequiredProcessIds $selectedDesktopIds
             $processReady=[bool]($selectedDesktopIds.Count -gt 0 -and $lastHandshake.AllRequiredProcessesVerified)
@@ -2612,7 +2659,7 @@ function Wait-CodexHealthyProcesses {
     if (-not $package.Found) {
         $process=Get-CodexProcessObservation -Package $package
         if($RequireDesktopHandshake){
-            $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config `
+            $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config -Package $package `
                 -RootProcessIdentities @(Get-JsonPropertyValue -Object $process -Name 'RootProcessIdentities')
         }
         return [ordered]@{Package=$package;Process=$process;Ready=$false;DesktopHandshake=$lastHandshake}
@@ -2626,7 +2673,7 @@ function Wait-CodexHealthyProcesses {
             [string](Get-JsonPropertyValue -Object $_ -Name 'classification') -ne 'TrustedPrevious' -and
             [int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId') -gt 0
         } | ForEach-Object {[int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId')} | Select-Object -Unique)
-        $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config `
+        $lastHandshake=Get-CodexDesktopHandshakeObservation -Config $Config -Package $package `
             -RootProcessIdentities @(Get-JsonPropertyValue -Object $process -Name 'RootProcessIdentities') `
             -RequiredProcessIds $selectedDesktopIds
         $processReady=[bool]($processReady -and $selectedDesktopIds.Count -gt 0 -and $lastHandshake.AllRequiredProcessesVerified)
@@ -3296,6 +3343,25 @@ function Invoke-CodexWatchdogMain {
             $decision = Get-WatchdogDecision -Observation $observation -State $workingState -Config $config -Now $now
         }
         $decision.Validation = Get-TriggerValidationReport -Decision $decision -Observation $observation -State $workingState -Config $config -Now $now
+        if(-not $WhatIfMode -and $RequestedAction -eq 'Check' -and $decision.Action -eq 'None' -and
+            [string](Get-JsonPropertyValue -Object $observation.Process -Name 'AppServerStatus') -eq 'Recognized' -and
+            [bool](Get-JsonPropertyValue -Object $observation.Process -Name 'SelectedCorePresent')){
+            $selectedDesktopIds=@((Get-JsonPropertyValue -Object $observation.Process -Name 'AppServerProcessIdentities') | Where-Object {
+                [string](Get-JsonPropertyValue -Object $_ -Name 'classification') -ne 'TrustedPrevious' -and
+                [int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId') -gt 0
+            } | ForEach-Object {[int](Get-JsonPropertyValue -Object $_ -Name 'desktopProcessId')} | Select-Object -Unique)
+            if($selectedDesktopIds.Count -gt 0){
+                try{
+                    $handshakeProbe=Get-CodexDesktopHandshakeObservation -Config $config -Package $observation.Package `
+                        -RootProcessIdentities @(Get-JsonPropertyValue -Object $observation.Process -Name 'RootProcessIdentities') `
+                        -RequiredProcessIds $selectedDesktopIds
+                }catch{
+                    $handshakeProbe=[ordered]@{Verified=$false;Status='ObservationFailed';AllRequiredProcessesVerified=$false}
+                }
+                if(-not $decision.Validation){$decision.Validation=[ordered]@{phase='observation';checks=@()}}
+                $decision.Validation['desktopHandshake']=$handshakeProbe
+            }
+        }
 
         $recovery = $null
         if (-not $WhatIfMode -and $RequestedAction -ne 'Status' -and $decision.Action -in @('Launch', 'Restart')) {

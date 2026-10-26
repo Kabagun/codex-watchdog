@@ -1236,6 +1236,132 @@ Describe 'Desktop handshake readiness gate' {
     }
 }
 
+Describe 'Packaged Desktop log roots' {
+    $script:packageLogsGetConfig=(Get-Command Get-WatchdogConfig).ScriptBlock
+    BeforeEach {
+        $script:packageLogsPriorLocalAppData=$env:LOCALAPPDATA
+        $env:LOCALAPPDATA=Join-Path $TestDrive ('isolated-local-app-data '+[guid]::NewGuid())
+        $script:packageLogsConfig=& $script:packageLogsGetConfig
+        $script:packageLogsFamily='OpenAI.Codex_abc123def4567'
+        $script:packageLogsCache=Join-Path $env:LOCALAPPDATA ('Packages\'+$script:packageLogsFamily+'\LocalCache\Local\Codex\Logs')
+        $null=New-Item -ItemType Directory -Path $script:packageLogsConfig.DesktopLogsRoot,$script:packageLogsCache -Force
+        $script:packageLogsPackage=[ordered]@{
+            Found=$true;Version='fixture';PackageFamilyName=$script:packageLogsFamily
+            DesktopExecutable='C:\synthetic-package\ChatGPT.exe';AppServerExecutable='C:\synthetic-package\resources\codex.exe'
+        }
+        $script:packageLogsStarted=[DateTimeOffset]::Parse('2026-10-26T20:39:11.6432890Z')
+        $script:packageLogsTimestamp=$script:packageLogsStarted.AddSeconds(3)
+        $script:packageLogsRoot=[ordered]@{
+            processId=73123;startedUtc=$script:packageLogsStarted.ToString('o');executablePath=$script:packageLogsPackage.DesktopExecutable
+        }
+        $script:packageLogsLine='{0} info [AppServerConnection] initialize_handshake_result outcome=success transportKind=stdio' -f $script:packageLogsTimestamp.ToString('o')
+    }
+    AfterEach {
+        $env:LOCALAPPDATA=$script:packageLogsPriorLocalAppData
+    }
+
+    It 'finds the current PID in the exact package cache when the ordinary log root has no date directories' {
+        $null=Write-TestDesktopHandshakeFile -LogsRoot $script:packageLogsCache -FileProcessId 73123 `
+            -Timestamp $script:packageLogsTimestamp -Line $script:packageLogsLine
+        $result=Get-CodexDesktopHandshakeObservation -Config $script:packageLogsConfig -Package $script:packageLogsPackage `
+            -RootProcessIdentities @($script:packageLogsRoot) -RequiredProcessIds @(73123)
+        $result.AllRequiredProcessesVerified | Should Be $true
+        $result.Evidence.PackageFamilyValidated | Should Be $true
+        $result.Evidence.UsesDefaultLogsRoot | Should Be $true
+        $normal=$result.Evidence.LogRoots | Where-Object Kind -eq 'Default'
+        $cache=$result.Evidence.LogRoots | Where-Object Kind -eq 'PackageLocalCache'
+        $normal.Available | Should Be $true
+        $normal.ExistingDirectoryCount | Should Be 0
+        $cache.ExistingDirectoryCount | Should Be 1
+        $cache.MatchingFileCount | Should Be 1
+        $cache.VerifiedProcessIds | Should Be @(73123)
+        ($result|ConvertTo-Json -Depth 8 -Compress) | Should Not Match 'isolated-local-app-data|OpenAI.Codex|LocalCache\\|synthetic-package'
+    }
+
+    It 'still rejects wrong PID and pre-start handshake events from the package cache' {
+        $null=Write-TestDesktopHandshakeFile -LogsRoot $script:packageLogsCache -FileProcessId 73124 `
+            -Timestamp $script:packageLogsTimestamp -Line $script:packageLogsLine
+        $wrongPid=Get-CodexDesktopHandshakeObservation -Config $script:packageLogsConfig -Package $script:packageLogsPackage `
+            -RootProcessIdentities @($script:packageLogsRoot) -RequiredProcessIds @(73123)
+        $wrongPid.Status | Should Be 'NoPidLogs'
+        $wrongPid.AllRequiredProcessesVerified | Should Be $false
+        $oldTimestamp=$script:packageLogsStarted.AddSeconds(-1)
+        $oldLine='{0} info [AppServerConnection] initialize_handshake_result outcome=success transportKind=stdio' -f $oldTimestamp.ToString('o')
+        $null=Write-TestDesktopHandshakeFile -LogsRoot $script:packageLogsCache -FileProcessId 73123 -Timestamp $oldTimestamp -Line $oldLine
+        $old=Get-CodexDesktopHandshakeObservation -Config $script:packageLogsConfig -Package $script:packageLogsPackage `
+            -RootProcessIdentities @($script:packageLogsRoot) -RequiredProcessIds @(73123)
+        $old.Status | Should Be 'HandshakeNotVerified'
+        $old.AllRequiredProcessesVerified | Should Be $false
+        ($old.Evidence.LogRoots | Where-Object Kind -eq 'PackageLocalCache').MatchingFileCount | Should Be 1
+    }
+
+    It 'keeps an explicitly configured fixture root isolated from the real package cache' {
+        $null=Write-TestDesktopHandshakeFile -LogsRoot $script:packageLogsCache -FileProcessId 73123 `
+            -Timestamp $script:packageLogsTimestamp -Line $script:packageLogsLine
+        $script:packageLogsConfig.DesktopLogsRoot=Join-Path $TestDrive 'custom-log-root'
+        $null=New-Item -ItemType Directory -Path $script:packageLogsConfig.DesktopLogsRoot -Force
+        $result=Get-CodexDesktopHandshakeObservation -Config $script:packageLogsConfig -Package $script:packageLogsPackage `
+            -RootProcessIdentities @($script:packageLogsRoot) -RequiredProcessIds @(73123)
+        $result.AllRequiredProcessesVerified | Should Be $false
+        $result.Evidence.UsesDefaultLogsRoot | Should Be $false
+        $result.Evidence.LogRoots.Count | Should Be 1
+        $result.Evidence.LogRoots[0].Kind | Should Be 'Configured'
+    }
+
+    It 'does not derive a package cache from an untrusted family path segment' -TestCases @(
+        @{Family='..\Other_abc123def4567'}
+        @{Family='OpenAI.Codex_short'}
+    ) {
+        param($Family)
+        $script:packageLogsPackage.PackageFamilyName=$Family
+        $result=Get-CodexDesktopHandshakeObservation -Config $script:packageLogsConfig -Package $script:packageLogsPackage `
+            -RootProcessIdentities @($script:packageLogsRoot) -RequiredProcessIds @(73123)
+        $result.Evidence.PackageFamilyValidated | Should Be $false
+        $result.Evidence.LogRoots.Count | Should Be 1
+    }
+
+    It 'records a bounded read-only handshake probe during ordinary Check without changing its action' -TestCases @(
+        @{HandshakePresent=$true}
+        @{HandshakePresent=$false}
+    ) {
+        param($HandshakePresent)
+        if($HandshakePresent){
+            $null=Write-TestDesktopHandshakeFile -LogsRoot $script:packageLogsCache -FileProcessId 73123 `
+                -Timestamp $script:packageLogsTimestamp -Line $script:packageLogsLine
+        }
+        $desktop=[pscustomobject]@{
+            Name='ChatGPT.exe';ProcessId=73123;ParentProcessId=1;CreationDate=$script:packageLogsStarted
+            ExecutablePath=$script:packageLogsPackage.DesktopExecutable;CommandLine='ChatGPT.exe'
+        }
+        $server=[pscustomobject]@{
+            Name='codex.exe';ProcessId=73124;ParentProcessId=73123;CreationDate=$script:packageLogsStarted.AddSeconds(1)
+            ExecutablePath=$script:packageLogsPackage.AppServerExecutable;CommandLine='codex.exe app-server'
+        }
+        $script:packageLogsObservation=New-TestObservation
+        $script:packageLogsObservation.TimestampUtc=$script:packageLogsTimestamp.ToString('o')
+        $script:packageLogsObservation.Package=$script:packageLogsPackage
+        $script:packageLogsObservation.Process=Get-CodexProcessObservation -Package $script:packageLogsPackage -Processes @($desktop,$server)
+        Mock Get-WatchdogConfig { $script:packageLogsConfig }
+        Mock Enter-WatchdogMutex { [ordered]@{Acquired=$true} }
+        Mock Exit-WatchdogMutex {}
+        Mock Read-WatchdogState { New-WatchdogState }
+        Mock Get-CodexObservation { $script:packageLogsObservation }
+        Mock Get-CodexDesktopLaunchPlan { [ordered]@{Mode='Enhanced';CanLaunch=$true} }
+        Mock Invoke-CodexRecovery { throw 'An ordinary healthy check must not recover.' }
+        $result=Invoke-CodexWatchdogMain -RequestedAction Check -AsJson | ConvertFrom-Json
+        $result.action | Should Be 'None'
+        $result.recovery | Should Be $null
+        $event=Get-Content -LiteralPath $script:packageLogsConfig.EventLogPath -Tail 1 | ConvertFrom-Json
+        $event.event | Should Be 'Check'
+        $event.outcome | Should Be 'None'
+        $event.validation.desktopHandshake.AllRequiredProcessesVerified | Should Be $HandshakePresent
+        $cache=$event.validation.desktopHandshake.Evidence.LogRoots | Where-Object Kind -eq 'PackageLocalCache'
+        $cache.MatchingFileCount | Should Be $(if($HandshakePresent){1}else{0})
+        $event.validation.desktopHandshake.RequiredProcessIds | Should Be @(73123)
+        Assert-MockCalled Invoke-CodexRecovery -Times 0 -Exactly -Scope It
+    }
+}
+
 Describe 'Managed core switching and rollback gates' {
     BeforeEach {
         $config=Get-WatchdogConfig
