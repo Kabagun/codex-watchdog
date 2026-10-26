@@ -85,6 +85,62 @@ function Write-RolloutFixture {
     return $path
 }
 
+function New-ManagedCoreFixture {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Version,
+        [string]$Contents = 'fixture managed core; never executed',
+        [switch]$RootManifest
+    )
+    $versionRoot = Join-Path $Root (Join-Path 'runtime' $Version)
+    $binRoot = Join-Path $versionRoot 'bin'
+    $null = New-Item -ItemType Directory -Path $binRoot -Force
+    $core = Join-Path $binRoot 'codex.exe'
+    [IO.File]::WriteAllText($core,$Contents,[Text.UTF8Encoding]::new($false))
+    $hash = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToUpperInvariant()
+    $relativeCore = "runtime/$Version/bin/codex.exe"
+    $manifest = [ordered]@{
+        localVersion=$Version
+        coreRelativePath=if ($RootManifest) { $relativeCore } else { 'bin/codex.exe' }
+        validation=[ordered]@{passed=$true}
+        components=@([ordered]@{relativePath=if ($RootManifest) { $relativeCore } else { 'bin/codex.exe' };sha256=$hash})
+    }
+    $manifestPath = if ($RootManifest) { Join-Path $Root 'manifest.json' } else { Join-Path $versionRoot '.capacity-manifest.json' }
+    $null = New-Item -ItemType Directory -Path $Root -Force
+    [IO.File]::WriteAllText($manifestPath,($manifest | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    return [ordered]@{Root=$Root;Version=$Version;Path=$core;Hash=$hash;ManifestPath=$manifestPath}
+}
+
+function New-LegacyUpgradeFixture {
+    param([Parameter(Mandatory)][string]$Root)
+    $old=New-ManagedCoreFixture -Root $Root -Version 'release-1' -RootManifest
+    $archiveDirectory=Join-Path $Root 'temp\previous-package-fixture'
+    $null=New-Item -ItemType Directory -Path $archiveDirectory -Force
+    $archiveManifest=Join-Path $archiveDirectory 'manifest.json'
+    Copy-Item -LiteralPath $old.ManifestPath -Destination $archiveManifest
+    $new=New-ManagedCoreFixture -Root $Root -Version 'release-3' -RootManifest
+    return [ordered]@{Old=$old;New=$new;ArchiveDirectory=$archiveDirectory;ArchiveManifest=$archiveManifest}
+}
+
+function New-ManagedCoreProcessFixture {
+    param(
+        [Parameter(Mandatory)][DateTimeOffset]$Now,
+        [Parameter(Mandatory)][string]$DesktopPath,
+        [Parameter(Mandatory)][string]$CorePath
+    )
+    $desktopStart = $Now.AddMinutes(-20)
+    $serverStart = $Now.AddMinutes(-19)
+    $main = [pscustomobject]@{
+        ProcessId=20;ParentProcessId=1;Name='ChatGPT.exe';ExecutablePath=$DesktopPath
+        CommandLine='desktop';CreationDate=$desktopStart
+    }
+    $server = [pscustomobject]@{
+        ProcessId=21;ParentProcessId=20;Name='codex.exe';ExecutablePath=$CorePath
+        CommandLine='codex.exe app-server';CreationDate=$serverStart
+    }
+    return [ordered]@{Desktop=$main;Server=$server;DesktopStartUtc=(ConvertTo-UtcString $desktopStart);ServerStartUtc=(ConvertTo-UtcString $serverStart)}
+}
+
 Describe 'Codex watchdog decision rules' {
     BeforeEach {
         $config = Get-WatchdogConfig
@@ -319,7 +375,7 @@ Describe 'Codex package process matching' {
         ($observation.AllPackageProcessIds -contains 10) | Should Be $false
     }
 
-    It 'recognizes only the descended app-server in the versioned local runtime path' {
+    It 'does not trust a version-shaped path without selected metadata or an exact persisted override' {
         $package = [ordered]@{
             Found = $true
             DesktopExecutable = 'C:\Program Files\WindowsApps\OpenAI.Codex_2.0\app\ChatGPT.exe'
@@ -336,10 +392,10 @@ Describe 'Codex package process matching' {
 
         $observation = Get-CodexProcessObservation -Package $package -Processes $processes
 
-        $observation.AppServerPresent | Should Be $true
-        @($observation.AppServerProcessIds) | Should Be @(21)
-        ($observation.AllPackageProcessIds -contains 21) | Should Be $true
-        foreach ($unrelatedId in @(22, 23, 24)) {
+        $observation.AppServerPresent | Should Be $false
+        $observation.AppServerStatus | Should Be 'Unknown'
+        @($observation.UnknownAppServerProcessIds) | Should Be @(21,22)
+        foreach ($unrelatedId in @(21, 22, 23, 24)) {
             ($observation.AllPackageProcessIds -contains $unrelatedId) | Should Be $false
         }
     }
@@ -381,8 +437,8 @@ Describe 'Configured core recognition and safe uncertainty' {
         $machine.Executable | Should Be ([IO.Path]::GetFullPath($core))
         $machine.Source | Should Be 'Machine'
         $process=Get-CodexAppServerOverride -EnvironmentValues @{User='';Machine='';Process=$oldCore}
-        $process.Executable | Should Be ([IO.Path]::GetFullPath($oldCore))
-        $process.Source | Should Be 'Process'
+        $process.Executable | Should Be ''
+        $process.Source | Should Be 'None'
     }
 
     It 'rejects invalid selected overrides without silently using an older core' {
@@ -422,13 +478,16 @@ Describe 'Configured core recognition and safe uncertainty' {
         $foreignMain.AppServerPresent | Should Be $false
     }
 
-    It 'keeps stock package and versioned core paths recognized' {
-        foreach($path in @($package.AppServerExecutable,(Join-Path $package.AppServerBinRoot 'version\codex.exe'))){
+    It 'keeps stock and the exact configured legacy path recognized without accepting arbitrary versions' {
+        foreach($path in @($package.AppServerExecutable,$core)){
             $server.ExecutablePath=$path
-            $stock=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
-            $stock.AppServerPresent | Should Be $true
-            $stock.AppServerStatus | Should Be 'Recognized'
+            $recognized=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+            $recognized.AppServerPresent | Should Be $true
+            $recognized.AppServerStatus | Should Be 'Recognized'
         }
+        $server.ExecutablePath=Join-Path $package.AppServerBinRoot 'future-build\codex.exe'
+        $unconfigured=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $unconfigured.AppServerStatus | Should Be 'Unknown'
     }
 
     It 'pauses automatic recovery when an override changes while its old direct server is still alive' {
@@ -455,8 +514,11 @@ Describe 'Configured core recognition and safe uncertainty' {
     It 'protects an unreadable direct server but does not recognize unknown nested CLI servers' {
         $server.ExecutablePath=$null
         (Get-CodexProcessObservation -Package $package -Processes @($main,$server)).AppServerStatus | Should Be 'Unknown'
+        $server.ExecutablePath=$oldCore;$server.CommandLine=''
+        $unreadableRole=Get-CodexProcessObservation -Package $package -Processes @($main,$server)
+        $unreadableRole.AppServerStatus | Should Be 'Unknown'
         $tool=[pscustomobject]@{ProcessId=30;ParentProcessId=20;Name='codex.exe';ExecutablePath=$core;CommandLine='codex.exe exec tool'}
-        $server.ExecutablePath=$oldCore;$server.ParentProcessId=30
+        $server.CommandLine='codex.exe app-server';$server.ParentProcessId=30
         $nested=Get-CodexProcessObservation -Package $package -Processes @($main,$tool,$server)
         $nested.AppServerStatus | Should Be 'Missing'
         @($nested.UnknownAppServerProcessIds).Count | Should Be 0
@@ -493,6 +555,309 @@ Describe 'Configured core recognition and safe uncertainty' {
         $confirmed=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now.AddMinutes(7)
         $confirmed.Action | Should Be 'Restart'
         $confirmed.Reason | Should Be 'AppServerMissing'
+    }
+}
+
+Describe 'Managed core switching and rollback gates' {
+    BeforeEach {
+        $config=Get-WatchdogConfig
+        $now=[DateTimeOffset]::Parse('2026-10-26T10:00:00Z')
+        $state=New-WatchdogState
+        $root=Join-Path $TestDrive ('portable runtime '+[guid]::NewGuid())
+        $old=New-ManagedCoreFixture -Root (Join-Path $root 'old') -Version '1.0.1'
+        $new=New-ManagedCoreFixture -Root (Join-Path $root 'new') -Version 'future-build-2029.7' -RootManifest
+        $stock='C:\WindowsApps\OpenAI.Codex_fixture\app\resources\codex.exe'
+        $desktop='C:\WindowsApps\OpenAI.Codex_fixture\app\ChatGPT.exe'
+        $newPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$desktop;AppServerExecutable=$stock
+            AppServerOverride=[ordered]@{Executable=$new.Path;Source='User';Error=$null;Managed=$true;MetadataValidated=$true;HashVerified=$true;Sha256=$new.Hash;Version=$new.Version;MetadataPath=$new.ManifestPath}
+        }
+        $previous=New-ManagedCoreProcessFixture -Now $now -DesktopPath $desktop -CorePath $old.Path
+        $state.lastHealthyCore=[ordered]@{
+            selector=[ordered]@{source='User';path=$old.Path}
+            core=[ordered]@{kind='Managed';path=$old.Path;sha256=$old.Hash;version=$old.Version}
+            process=[ordered]@{pid=21;startUtc=$previous.ServerStartUtc;desktopPid=20;desktopStartUtc=$previous.DesktopStartUtc}
+            healthyAtUtc=$now.AddMinutes(-2).ToString('o')
+        }
+        $oldProcessSet=Get-CodexProcessObservation -Package $newPackage -Processes @($previous.Desktop,$previous.Server) -TrustedPreviousCore $state.lastHealthyCore
+        $observation=New-TestObservation
+        $observation.Package=$newPackage
+        $observation.Process=$oldProcessSet
+    }
+
+    It 'validates a future runtime version through its root manifest without a version allowlist' {
+        $resolved=Get-CodexAppServerOverride -EnvironmentValues @{User=$new.Path;Machine=''}
+        $resolved.Error | Should Be $null
+        $resolved.Managed | Should Be $true
+        $resolved.MetadataValidated | Should Be $true
+        $resolved.HashVerified | Should Be $true
+        $resolved.Version | Should Be 'future-build-2029.7'
+        $resolved.Sha256 | Should Be $new.Hash
+    }
+
+    It 'uses the archived manifest for the old core after a same-root legacy upgrade and rejects tampered archives' {
+        $upgrade=New-LegacyUpgradeFixture -Root (Join-Path $TestDrive ('legacy compactfix '+[guid]::NewGuid()))
+        $oldSelected=Get-CodexAppServerOverride -EnvironmentValues @{User=$upgrade.Old.Path;Machine=''}
+        $newSelected=Get-CodexAppServerOverride -EnvironmentValues @{User=$upgrade.New.Path;Machine=''}
+        $oldSelected.Error | Should Be $null
+        $oldSelected.Managed | Should Be $true
+        $oldSelected.HashVerified | Should Be $true
+        $oldSelected.Sha256 | Should Be $upgrade.Old.Hash
+        $newSelected.Error | Should Be $null
+
+        $desktop='C:\WindowsApps\OpenAI.Codex_fixture\app\ChatGPT.exe'
+        $stock='C:\WindowsApps\OpenAI.Codex_fixture\app\resources\codex.exe'
+        $handoverPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$desktop;AppServerExecutable=$stock
+            AppServerOverride=$newSelected
+        }
+        $runningOld=New-ManagedCoreProcessFixture -Now $now -DesktopPath $desktop -CorePath $upgrade.Old.Path
+        $handoverState=New-WatchdogState
+        $handoverState.lastHealthyCore=[ordered]@{
+            selector=[ordered]@{source='User';path=$upgrade.Old.Path}
+            core=[ordered]@{kind='Managed';path=$upgrade.Old.Path;sha256=$upgrade.Old.Hash;version=$upgrade.Old.Version}
+            process=[ordered]@{pid=21;startUtc=$runningOld.ServerStartUtc;desktopPid=20;desktopStartUtc=$runningOld.DesktopStartUtc}
+            healthyAtUtc=$now.AddMinutes(-1).ToString('o')
+        }
+        $handover=Get-CodexProcessObservation -Package $handoverPackage -Processes @($runningOld.Desktop,$runningOld.Server) -TrustedPreviousCore $handoverState.lastHealthyCore
+        $handover.TrustedPreviousCorePresent | Should Be $true
+        $handover.CoreSwitchPending | Should Be $true
+        $handover.AppServerProcessIdentities[0].classification | Should Be 'TrustedPrevious'
+        $publicObservation=New-TestObservation
+        $publicObservation.TimestampUtc=$now.ToString('o')
+        $publicObservation.Package=$handoverPackage
+        $publicObservation.Process=$handover
+        $publicObservation.Threads=@()
+        $public=ConvertTo-PublicResult -Observation $publicObservation -Decision (New-WatchdogDecision -Action None -Reason CoreSelectionChanged)
+        $public.core.selection.path | Should Be $upgrade.New.Path
+        $public.core.selection.sha256 | Should Be $upgrade.New.Hash
+        $public.core.selection.hashVerified | Should Be $true
+        $public.core.selectedPresent | Should Be $false
+        $public.core.pending | Should Be $true
+        $public.core.ready | Should Be $false
+        $public.core.active[0].classification | Should Be 'TrustedPrevious'
+        $public.core.active[0].processId | Should Be 21
+        $public.appServerOverride.Contains('RawValue') | Should Be $false
+        $public.appServerOverride.Contains('RegistryKind') | Should Be $false
+
+        # The post-rollback User selection resolves through the archived .1 manifest as well.
+        $afterRollback=Get-CodexAppServerOverride -EnvironmentValues @{User=$upgrade.Old.Path;Machine=''}
+        $afterRollback.Error | Should Be $null
+        $afterRollback.HashVerified | Should Be $true
+        $afterRollback.Sha256 | Should Be $upgrade.Old.Hash
+
+        $archiveText=Get-Content -LiteralPath $upgrade.ArchiveManifest -Raw
+        $archive=ConvertFrom-Json -InputObject $archiveText -AsHashtable
+        $archive.components[0].sha256='0000000000000000000000000000000000000000000000000000000000000000'
+        [IO.File]::WriteAllText($upgrade.ArchiveManifest,($archive|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+        $tamperedArchive=Get-CodexAppServerOverride -EnvironmentValues @{User=$upgrade.Old.Path;Machine=''}
+        [bool]$tamperedArchive.Error | Should Be $true
+        [IO.File]::WriteAllText($upgrade.ArchiveManifest,$archiveText,[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($upgrade.ArchiveManifest,'{ malformed',[Text.UTF8Encoding]::new($false))
+        $malformedArchive=Get-CodexAppServerOverride -EnvironmentValues @{User=$upgrade.Old.Path;Machine=''}
+        [bool]$malformedArchive.Error | Should Be $true
+        [IO.File]::WriteAllText($upgrade.ArchiveManifest,$archiveText,[Text.UTF8Encoding]::new($false))
+
+        $currentManifestText=Get-Content -LiteralPath $upgrade.New.ManifestPath -Raw
+        $currentManifest=ConvertFrom-Json -InputObject $currentManifestText -AsHashtable
+        $currentManifest.components[0].sha256='FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+        [IO.File]::WriteAllText($upgrade.New.ManifestPath,($currentManifest|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+        $tamperedCurrent=Get-CodexAppServerOverride -EnvironmentValues @{User=$upgrade.Old.Path;Machine=''}
+        [bool]$tamperedCurrent.Error | Should Be $true
+        [IO.File]::WriteAllText($upgrade.New.ManifestPath,$currentManifestText,[Text.UTF8Encoding]::new($false))
+
+        [IO.File]::WriteAllText($upgrade.New.ManifestPath,'{ malformed',[Text.UTF8Encoding]::new($false))
+        $malformedCurrent=Get-CodexAppServerOverride -EnvironmentValues @{User=$upgrade.Old.Path;Machine=''}
+        [bool]$malformedCurrent.Error | Should Be $true
+    }
+
+    It 'rejects a tampered managed core and a versioned runtime with missing metadata' {
+        Add-Content -LiteralPath $new.Path -Value 'tampered'
+        $tampered=Get-CodexAppServerOverride -EnvironmentValues @{User=$new.Path;Machine=''}
+        [bool]$tampered.Error | Should Be $true
+        $missingRoot=Join-Path $TestDrive ('missing metadata '+[guid]::NewGuid())
+        $missing=Join-Path $missingRoot 'runtime\unlisted-build\bin\codex.exe'
+        $null=New-Item -ItemType Directory -Path (Split-Path -Parent $missing) -Force
+        Set-Content -LiteralPath $missing -Value 'fixture'
+        $unmanifested=Get-CodexAppServerOverride -EnvironmentValues @{User=$missing;Machine=''}
+        [bool]$unmanifested.Error | Should Be $true
+    }
+
+    It 'recognizes the hash-verified previous core and requests one switch to the selected future core' {
+        $observation.Process.CoreSwitchPending | Should Be $true
+        $observation.Process.TrustedPreviousCorePresent | Should Be $true
+        $observation.Process.AppServerStatus | Should Be 'Recognized'
+        $observation.Process.AppServerProcessIdentities[0].classification | Should Be 'TrustedPrevious'
+        $decision=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+        $decision.Action | Should Be 'Restart'
+        $decision.Reason | Should Be 'CoreSelectionChanged'
+    }
+
+    It 'switches when the old server is gone but the selected managed core is not running yet' {
+        $missing=Get-CodexProcessObservation -Package $newPackage -Processes @($previous.Desktop) -TrustedPreviousCore $state.lastHealthyCore
+        $missing.AppServerStatus | Should Be 'Missing'
+        $missing.CoreSwitchPending | Should Be $true
+        $observation.Process=$missing
+        $decision=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+        $decision.Reason | Should Be 'CoreSelectionChanged'
+    }
+
+    It 'accepts an already-running selected core and updates the healthy identity without restarting' {
+        $newServer=[pscustomobject]@{
+            ProcessId=31;ParentProcessId=20;Name='codex.exe';ExecutablePath=$new.Path
+            CommandLine='codex.exe app-server';CreationDate=$now.AddMinutes(-2)
+        }
+        $selected=Get-CodexProcessObservation -Package $newPackage -Processes @($previous.Desktop,$newServer) -TrustedPreviousCore $state.lastHealthyCore
+        $selected.SelectedCorePresent | Should Be $true
+        $selected.CoreSwitchPending | Should Be $false
+        $observation.Process=$selected
+        $decision=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+        $decision.Action | Should Be 'None'
+        (Set-LastHealthyCoreFromObservation -State $state -Observation $observation -Now $now) | Should Be $true
+        $state.lastHealthyCore.core.path | Should Be $new.Path
+    }
+
+    It 'defers a core switch while a healthy task protects the shared Desktop' {
+        $task=New-TestThread -ThreadId '60000000-0000-0000-0000-000000000001' -Status 'ToolRunning' -Now $now
+        $observation.Threads=@($task)
+        $decision=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+        $decision.Action | Should Be 'None'
+        $decision.Reason | Should Be 'HealthyTaskProtectsSharedApp'
+    }
+
+    It 'leaves a matching old server unknown and never looks up or kills it without the saved identity' {
+        $script:untrustedOldServer=Get-CodexProcessObservation -Package $newPackage -Processes @($previous.Desktop,$previous.Server)
+        $script:untrustedOldServer.AppServerStatus | Should Be 'Unknown'
+        Mock Get-CodexProcessObservation { $script:untrustedOldServer } -ParameterFilter { [object]::ReferenceEquals($Package,$script:unknownCorePackage) }
+        Mock Get-Process { throw 'An unknown process must not be looked up.' }
+        Mock Stop-Process { throw 'An unknown process must not be stopped.' }
+        $script:unknownCorePackage=$newPackage
+        $failure=$null
+        try { Stop-CodexPackageProcesses -Package $newPackage -Config $config } catch { $failure=$_ }
+        $failure.Exception.Message | Should Be 'An unrecognized live Codex app-server was found; refusing to close or stop the application.'
+        Assert-MockCalled Get-Process -Times 0 -Exactly -Scope It
+        Assert-MockCalled Stop-Process -Times 0 -Exactly -Scope It
+    }
+
+    It 'does not report readiness when the running server differs from the selected path and hash' {
+        $oldPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$desktop;AppServerExecutable=$stock
+            AppServerOverride=[ordered]@{Executable=$old.Path;Source='User';Error=$null;Managed=$true;MetadataValidated=$true;HashVerified=$true;Sha256=$old.Hash;Version=$old.Version;MetadataPath=$old.ManifestPath}
+        }
+        $script:oldSelection=Get-CodexDesiredCoreIdentity -Package $oldPackage
+        $script:expectedCore=Get-CodexDesiredCoreIdentity -Package $newPackage
+        Mock Start-Sleep {}
+        $script:readinessMismatchPackage=$oldPackage
+        Mock Get-CodexPackageInfo { $script:readinessMismatchPackage }
+        Mock Get-CodexProcessObservation {
+            [ordered]@{CoreSelection=$script:oldSelection;DesktopPresent=$true;SelectedCorePresent=$true;TrustedPreviousCorePresent=$false;AppServerStatus='Recognized'}
+        }
+        $result=Wait-CodexHealthyProcesses -Config $config -InitialPackage $newPackage -TimeoutSeconds 0 -ExpectedCore $script:expectedCore
+        $result.Ready | Should Be $false
+    }
+
+    It 'passes the fresh persisted selection to Enhanced and clears a stale process-only override for stock' {
+        $plan=[ordered]@{CanLaunch=$true;Mode='Enhanced';LauncherPath='fixture';Executable='pwsh.exe';Arguments='';WorkingDirectory=$TestDrive}
+        $prior=[Environment]::GetEnvironmentVariable('CODEX_CLI_PATH','Process')
+        try {
+            [Environment]::SetEnvironmentVariable('CODEX_CLI_PATH','C:\stale\codex.exe','Process')
+            Mock Start-Process {
+                $script:observedChildCore=[Environment]::GetEnvironmentVariable('CODEX_CLI_PATH','Process')
+                $script:observedChildCorePresent=[Environment]::GetEnvironmentVariables('Process').Contains('CODEX_CLI_PATH')
+                [pscustomobject]@{Id=777}
+            }
+            Mock Get-CodexAppServerOverride { [ordered]@{Executable=$script:managedNewPath;Source='User';Error=$null} }
+            $script:managedNewPath=$new.Path
+            $null=Start-CodexDesktop -Package $newPackage -UserHome $config.UserHome -LaunchPlan $plan
+            $script:observedChildCore | Should Be $script:managedNewPath
+            [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH','Process') | Should Be 'C:\stale\codex.exe'
+
+            Mock Get-CodexAppServerOverride { [ordered]@{Executable='';Source='None';Error=$null} }
+            $script:observedChildCore='not-cleared'
+            $script:observedChildCorePresent=$true
+            $null=Start-CodexDesktop -Package $newPackage -UserHome $config.UserHome -LaunchPlan $plan
+            $script:observedChildCorePresent | Should Be $false
+            [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH','Process') | Should Be 'C:\stale\codex.exe'
+        } finally {
+            [Environment]::SetEnvironmentVariable('CODEX_CLI_PATH',$prior,'Process')
+        }
+    }
+
+    It 'rolls back once to the verified previous selector and refuses a foreign selector change' {
+        $attempt=[ordered]@{status='Attempting';target=[ordered]@{source='User';path=$new.Path;sha256=$new.Hash}}
+        $plan=Get-CoreSelectionRollbackPlan -Attempt $attempt -LastHealthyCore $state.lastHealthyCore -EnvironmentValues @{User=$new.Path;Machine=''}
+        $plan.CanRollback | Should Be $true
+        $plan.UserValue | Should Be $old.Path
+        $conflict=Get-CoreSelectionRollbackPlan -Attempt $attempt -LastHealthyCore $state.lastHealthyCore -EnvironmentValues @{User='C:\user-selected\codex.exe';Machine=''}
+        $conflict.CanRollback | Should Be $false
+        $conflict.Reason | Should Be 'SelectedValueChanged'
+
+        $config.DataRoot=Join-Path $TestDrive 'rollback-state'
+        $config.StatePath=Join-Path $config.DataRoot 'state.json'
+        $config.SnapshotRoot=Join-Path $config.DataRoot 'snapshots'
+        $script:rollbackPackage=[ordered]@{
+            Found=$true;Version='fixture';DesktopExecutable=$desktop;AppServerExecutable=$stock
+            AppServerOverride=[ordered]@{Executable=$old.Path;Source='User';Error=$null;Managed=$true;MetadataValidated=$true;HashVerified=$true;Sha256=$old.Hash;Version=$old.Version;MetadataPath=$old.ManifestPath}
+        }
+        $expected=Get-CodexDesiredCoreIdentity -Package $script:rollbackPackage
+        $serverIdentity=[ordered]@{classification='Selected';processId=31;startedUtc=$now.ToString('o');desktopProcessId=30;desktopStartedUtc=$now.ToString('o')}
+        $script:rollbackProcess=[ordered]@{
+            CoreSelection=$expected;DesktopPresent=$true;SelectedCorePresent=$true;TrustedPreviousCorePresent=$false
+            AppServerStatus='Recognized';AppServerPresent=$true;CoreSwitchPending=$false;AllPackageProcessIds=@(30,31)
+            AppServerProcessIdentities=@($serverIdentity)
+        }
+        $script:rollbackEnvironmentWrites=0
+        Mock Get-CodexProcessObservation { [ordered]@{AppServerStatus='Missing';AllPackageProcessIds=@()} }
+        Mock Set-PersistedUserCodexSelection { $script:rollbackEnvironmentWrites++ }
+        Mock Get-CodexPackageInfo { $script:rollbackPackage }
+        Mock Get-CodexDesktopLaunchPlan { [ordered]@{Mode='Enhanced';CanLaunch=$true} }
+        Mock Start-CodexDesktop { [ordered]@{Mode='Enhanced'} }
+        Mock Wait-CodexHealthyProcesses { [ordered]@{Ready=$true;Package=$script:rollbackPackage;Process=$script:rollbackProcess} }
+        Mock Get-CodexDatabasePaths { [ordered]@{State='state';Logs='logs'} }
+        Mock Test-CodexDatabaseIntegrity { [ordered]@{Healthy=$true;State='ok';Logs='ok'} }
+        Mock Get-RemoteEnrollmentObservation { [ordered]@{Status='Enabled';EnabledCount=1} }
+        $rollback=Invoke-CoreSelectionRollback -Config $config -State $state -Attempt $attempt -CurrentPackage $newPackage -TimeoutSeconds 1 -EnvironmentValues @{User=$new.Path;Machine=''}
+        $rollback.Successful | Should Be $true
+        $script:rollbackEnvironmentWrites | Should Be 1
+        $again=Invoke-CoreSelectionRollback -Config $config -State $state -Attempt $attempt -CurrentPackage $newPackage -TimeoutSeconds 1 -EnvironmentValues @{User=$new.Path;Machine=''}
+        $again.Reason | Should Be 'RollbackAlreadyAttempted'
+        $script:rollbackEnvironmentWrites | Should Be 1
+    }
+}
+
+Describe 'Stable Watchdog install target' {
+    It 'copies only changed source files and builds the task action against the stable copy' {
+        $config=Get-WatchdogConfig
+        $config.InstallRoot=Join-Path $TestDrive ('Programs\CodexWatchdog '+[guid]::NewGuid())
+        $sourceScript=$config.ScriptPath
+        $sourceLauncher=$config.LauncherPath
+        $config.SourceScriptPath=$sourceScript
+        $config.SourceLauncherPath=$sourceLauncher
+        $first=Install-WatchdogStableScripts -Config $config
+        $first.ScriptPath | Should Be (Join-Path $config.InstallRoot 'CodexWatchdog.ps1')
+        (Get-FileHash -LiteralPath $first.ScriptPath).Hash | Should Be (Get-FileHash -LiteralPath $sourceScript).Hash
+        (Get-FileHash -LiteralPath $first.LauncherPath).Hash | Should Be (Get-FileHash -LiteralPath $sourceLauncher).Hash
+        $scriptTime=(Get-Item -LiteralPath $first.ScriptPath).LastWriteTimeUtc
+        $again=Install-WatchdogStableScripts -Config $config
+        (Get-Item -LiteralPath $again.ScriptPath).LastWriteTimeUtc | Should Be $scriptTime
+        $xml=New-WatchdogScheduledTaskXml -Config $config -PowerShellPath 'C:\Program Files\PowerShell\7\pwsh.exe' -WScriptPath 'C:\Windows\System32\wscript.exe' -Sid 'S-1-5-21-100' -Author 'Fixture'
+        $xml | Should Match ([regex]::Escape($first.ScriptPath))
+        $xml | Should Match ([regex]::Escape($first.LauncherPath))
+        $xml | Should Match '<LogonType>InteractiveToken</LogonType>'
+        $xml | Should Match '<RunLevel>LeastPrivilege</RunLevel>'
+        $xml | Should Not Match ([regex]::Escape($sourceScript))
+    }
+
+    It 'keeps Install WhatIf read-only and previews the stable script path' {
+        $script:installWhatIfConfig=Get-WatchdogConfig
+        $script:installWhatIfConfig.InstallRoot=Join-Path $TestDrive ('not-created '+[guid]::NewGuid())
+        Mock Get-WatchdogConfig { $script:installWhatIfConfig }
+        Mock Install-WatchdogScheduledTask { throw 'WhatIf must not install a task.' }
+        $result=Invoke-CodexWatchdogMain -RequestedAction Install -AsJson -WhatIfMode | ConvertFrom-Json
+        $result.action | Should Be 'WouldInstall'
+        $result.script | Should Be (Join-Path $script:installWhatIfConfig.InstallRoot 'CodexWatchdog.ps1')
+        (Test-Path -LiteralPath $script:installWhatIfConfig.InstallRoot) | Should Be $false
+        Assert-MockCalled Install-WatchdogScheduledTask -Times 0 -Exactly -Scope It
     }
 }
 

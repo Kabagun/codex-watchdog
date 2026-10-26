@@ -44,6 +44,9 @@ function Get-WatchdogConfig {
         ScriptPath                    = $script:WatchdogScriptPath
         LauncherPath                  = Join-Path $scriptRoot 'CodexWatchdogLauncher.vbs'
         UserHome                      = [Environment]::GetFolderPath('UserProfile')
+        InstallRoot                   = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Programs\CodexWatchdog'
+        SourceScriptPath              = $script:WatchdogScriptPath
+        SourceLauncherPath            = Join-Path $scriptRoot 'CodexWatchdogLauncher.vbs'
         StartupDirectory              = [Environment]::GetFolderPath('Startup')
         PreDispatchFreezeMinutes      = 3
         ProgressStaleMinutes          = 60
@@ -97,6 +100,8 @@ function New-WatchdogState {
         staleCandidates             = @()
         automaticRecoveryHistoryUtc = @()
         failedRecoveryUntilUtc      = $null
+        lastHealthyCore             = $null
+        coreSwitchAttempt           = $null
         lastCheckUtc                = $null
         lastDecision                = $null
         lastReason                  = $null
@@ -127,6 +132,9 @@ function Read-WatchdogState {
             } else {
                 $state[$key] = @($state[$key])
             }
+        }
+        foreach ($key in @('lastHealthyCore', 'coreSwitchAttempt')) {
+            if (-not $state.ContainsKey($key)) { $state[$key] = $null }
         }
         return $state
     } catch {
@@ -243,25 +251,305 @@ function Write-DiagnosticSnapshot {
     }
 }
 
-function Get-CodexAppServerOverride {
-    <#
-    .SYNOPSIS
-    Resolves the current user's exact configured core path without relying on a stale task environment.
-    .DESCRIPTION
-    Persisted User settings override Machine settings; Process is a fallback when neither exists.
-    An invalid selected value is reported rather than silently falling back to an older core.
-    EnvironmentValues can supply a captured environment for read-only inspection or tests.
-    #>
-    param([System.Collections.IDictionary]$EnvironmentValues)
+function Test-CodexPathHasReparsePoint {
+    param([Parameter(Mandatory)][string]$Path)
 
-    if (-not $PSBoundParameters.ContainsKey('EnvironmentValues')) {
-        $EnvironmentValues = [ordered]@{
-            User = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'User')
-            Machine = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Machine')
-            Process = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Process')
+    try {
+        $current = [IO.Path]::GetFullPath($Path)
+        while ($current) {
+            if (Test-Path -LiteralPath $current) {
+                $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $true }
+            }
+            $parent = [IO.Path]::GetDirectoryName($current.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
+            if (-not $parent -or $parent -ieq $current) { break }
+            $current = $parent
+        }
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Get-CodexPersistedEnvironmentValue {
+    param([Parameter(Mandatory)][ValidateSet('User','Machine')][string]$Source)
+    $key = $null
+    try {
+        if ($Source -eq 'User') {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment',$false)
+        } else {
+            $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Control\Session Manager\Environment',$false)
+        }
+        $effective = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH',$Source)
+        if ($key -and $key.GetValueNames() -contains 'CODEX_CLI_PATH') {
+            $rawValue = [string]$key.GetValue('CODEX_CLI_PATH',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $kind = [string]$key.GetValueKind('CODEX_CLI_PATH')
+            if ($kind -eq 'ExpandString') { $effective = [Environment]::ExpandEnvironmentVariables($rawValue) }
+            elseif ($null -eq $effective) { $effective = $rawValue }
+            return [ordered]@{Value=$effective;RawValue=$rawValue;RegistryKind=$kind}
+        }
+        return [ordered]@{Value=$effective;RawValue=$effective;RegistryKind=''}
+    } catch {
+        return [ordered]@{Value=[Environment]::GetEnvironmentVariable('CODEX_CLI_PATH',$Source);RawValue=[Environment]::GetEnvironmentVariable('CODEX_CLI_PATH',$Source);RegistryKind=''}
+    }
+    finally { if ($key) { $key.Dispose() } }
+}
+
+function Test-CodexVersionedCorePath {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$InstallRoot)
+
+    try {
+        $fullPath=[IO.Path]::GetFullPath($Path)
+        $relative=[IO.Path]::GetRelativePath([IO.Path]::GetFullPath($InstallRoot),$fullPath)
+        if ([IO.Path]::IsPathRooted($relative) -or @($relative -split '[\\/]') -contains '..') { return $false }
+        $parts=@($relative -split '[\\/]')
+        return [bool]($parts.Count -eq 4 -and $parts[0] -ieq 'runtime' -and
+            $parts[1] -and $parts[2] -ieq 'bin' -and $parts[3] -ieq 'codex.exe')
+    } catch { return $false }
+}
+
+function Resolve-CodexManifestDeclaredCorePath {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Manifest,
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$VersionDirectory
+    )
+
+    $declared=[string]$Manifest.coreRelativePath
+    if ([string]::IsNullOrWhiteSpace($declared) -or [IO.Path]::IsPathRooted($declared) -or
+        (@($declared -split '[\\/]') -contains '..')) { return '' }
+    foreach ($base in @($InstallRoot,$VersionDirectory)) {
+        try {
+            $candidate=[IO.Path]::GetFullPath((Join-Path $base $declared.Replace('/',[IO.Path]::DirectorySeparatorChar)))
+            if (Test-CodexVersionedCorePath -Path $candidate -InstallRoot $InstallRoot) { return $candidate }
+        } catch { }
+    }
+    return ''
+}
+
+function Get-CodexManifestCoreHash {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Manifest,
+        [Parameter(Mandatory)][string]$ExecutablePath,
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$VersionDirectory
+    )
+
+    if (-not ($Manifest.validation -is [System.Collections.IDictionary]) -or $Manifest.validation.passed -ne $true) {
+        throw 'The managed core metadata has not passed validation.'
+    }
+    $declaredPath=Resolve-CodexManifestDeclaredCorePath -Manifest $Manifest -InstallRoot $InstallRoot -VersionDirectory $VersionDirectory
+    if (-not $declaredPath -or $declaredPath -ine [IO.Path]::GetFullPath($ExecutablePath)) {
+        throw 'The managed core metadata does not declare this core path.'
+    }
+    $matches=@()
+    foreach ($component in @($Manifest.components)) {
+        $relativePath=[string]$component.relativePath
+        $componentHash=[string]$component.sha256
+        if ([string]::IsNullOrWhiteSpace($relativePath) -or [IO.Path]::IsPathRooted($relativePath) -or
+            (@($relativePath -split '[\\/]') -contains '..')) { continue }
+        foreach ($base in @($InstallRoot,$VersionDirectory)) {
+            try {
+                $candidate=[IO.Path]::GetFullPath((Join-Path $base $relativePath.Replace('/',[IO.Path]::DirectorySeparatorChar)))
+                if ($candidate -ieq [IO.Path]::GetFullPath($ExecutablePath)) { $matches += $componentHash.ToUpperInvariant() }
+            } catch { }
         }
     }
-    foreach ($source in @('User', 'Machine', 'Process')) {
+    $uniqueHashes=@($matches | Select-Object -Unique)
+    if ($uniqueHashes.Count -ne 1 -or $uniqueHashes[0] -notmatch '^[A-F0-9]{64}$') {
+        throw 'The managed core metadata is missing a unique SHA-256 component entry.'
+    }
+    if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf) -or (Test-CodexPathHasReparsePoint -Path $ExecutablePath)) {
+        throw 'The managed core file is missing or contains a reparse point.'
+    }
+    $actualHash=(Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+    if ($actualHash -cne $uniqueHashes[0]) { throw 'The managed core hash does not match its validation metadata.' }
+    return [string]$uniqueHashes[0]
+}
+
+function Find-CodexArchivedCoreManifest {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$VersionDirectory,
+        [Parameter(Mandatory)][string]$ExecutablePath
+    )
+
+    $archiveRoot=Join-Path $InstallRoot 'temp'
+    if (-not (Test-Path -LiteralPath $archiveRoot -PathType Container) -or (Test-CodexPathHasReparsePoint -Path $archiveRoot)) { return '' }
+    $archives=@(Get-ChildItem -LiteralPath $archiveRoot -Directory -Filter 'previous-package-*' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 16)
+    foreach ($archive in $archives) {
+        if (Test-CodexPathHasReparsePoint -Path $archive.FullName) { continue }
+        $manifestPath=Join-Path $archive.FullName 'manifest.json'
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { continue }
+        if (Test-CodexPathHasReparsePoint -Path $manifestPath) { continue }
+        try {
+            $manifest=Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -Depth 16 -ErrorAction Stop
+        } catch {
+            throw 'A previous-package manifest is corrupt; historical core trust is unavailable.'
+        }
+        if (-not ($manifest -is [System.Collections.IDictionary])) {
+            throw 'A previous-package manifest is malformed; historical core trust is unavailable.'
+        }
+        $declaredPath=Resolve-CodexManifestDeclaredCorePath -Manifest $manifest -InstallRoot $InstallRoot -VersionDirectory $VersionDirectory
+        if (-not $declaredPath -or $declaredPath -ine [IO.Path]::GetFullPath($ExecutablePath)) { continue }
+        # Once metadata claims this exact executable, any validation or hash failure is final.
+        $null=Get-CodexManifestCoreHash -Manifest $manifest -ExecutablePath $ExecutablePath -InstallRoot $InstallRoot -VersionDirectory $VersionDirectory
+        return $manifestPath
+    }
+    return ''
+}
+
+function Get-CodexManagedCoreIdentity {
+    <# Resolves a versioned runtime core through its nearest validated publisher manifest. #>
+    param(
+        [Parameter(Mandatory)][string]$ExecutablePath,
+        [switch]$SkipHashVerification
+    )
+
+    $identity = [ordered]@{
+        Managed = $false
+        Valid = $false
+        HashVerified = $false
+        Executable = ''
+        Version = ''
+        Sha256 = ''
+        MetadataPath = ''
+        Error = $null
+    }
+    try {
+        if (-not [IO.Path]::IsPathFullyQualified($ExecutablePath)) { throw 'The configured codex.exe path must be absolute.' }
+        $path = [IO.Path]::GetFullPath($ExecutablePath)
+        if ([IO.Path]::GetFileName($path) -ine 'codex.exe') { throw 'CODEX_CLI_PATH must name codex.exe.' }
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'The configured codex.exe does not exist.' }
+        if (Test-CodexPathHasReparsePoint -Path $path) { throw 'The configured core path contains a reparse point.' }
+
+        $binDirectory = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName($path))
+        if ($binDirectory.Name -ine 'bin' -or $null -eq $binDirectory.Parent -or $null -eq $binDirectory.Parent.Parent -or
+            $binDirectory.Parent.Parent.Name -ine 'runtime' -or $null -eq $binDirectory.Parent.Parent.Parent) {
+            return $identity
+        }
+
+        $versionDirectory = $binDirectory.Parent
+        $runtimeDirectory = $versionDirectory.Parent
+        $installRoot = $runtimeDirectory.Parent
+        $identity.Managed = $true
+        $identity.Executable = $path
+        foreach ($directory in @($binDirectory, $versionDirectory, $runtimeDirectory, $installRoot)) {
+            if (-not (Test-Path -LiteralPath $directory.FullName -PathType Container) -or
+                (Test-CodexPathHasReparsePoint -Path $directory.FullName)) {
+                throw 'The managed core directory chain is missing or contains a reparse point.'
+            }
+        }
+
+        $versionReceipt = @(
+            (Join-Path $versionDirectory.FullName '.capacity-manifest.json'),
+            (Join-Path $versionDirectory.FullName 'manifest.json'),
+            (Join-Path $versionDirectory.FullName 'receipt.json')
+        ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+        $rootManifest = Join-Path $installRoot.FullName 'manifest.json'
+        $metadataPath = if ($versionReceipt) { [string]$versionReceipt } elseif (Test-Path -LiteralPath $rootManifest -PathType Leaf) { $rootManifest } else { '' }
+        if (-not $metadataPath) { throw 'A versioned runtime core is missing its validation manifest.' }
+        if (-not $versionReceipt -and $metadataPath -ieq $rootManifest) {
+            if (Test-CodexPathHasReparsePoint -Path $rootManifest) { throw 'The managed core metadata path contains a reparse point.' }
+            $currentManifest=Get-Content -LiteralPath $rootManifest -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -Depth 16 -ErrorAction Stop
+            if (-not ($currentManifest -is [System.Collections.IDictionary]) -or
+                -not ($currentManifest.validation -is [System.Collections.IDictionary]) -or
+                $currentManifest.validation.passed -ne $true) {
+                throw 'The managed core metadata has not passed validation.'
+            }
+            $rootDeclaredCore=Resolve-CodexManifestDeclaredCorePath -Manifest $currentManifest -InstallRoot $installRoot.FullName -VersionDirectory $versionDirectory.FullName
+            if (-not $rootDeclaredCore) { throw 'The root manifest does not declare a versioned core in this installation.' }
+            if ($rootDeclaredCore -ine $path) {
+                $currentVersionDirectory=[IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($rootDeclaredCore))
+                if (-not (Test-CodexVersionedCorePath -Path $rootDeclaredCore -InstallRoot $installRoot.FullName)) {
+                    throw 'The root manifest does not declare a versioned core in this installation.'
+                }
+                $null=Get-CodexManifestCoreHash -Manifest $currentManifest -ExecutablePath $rootDeclaredCore -InstallRoot $installRoot.FullName -VersionDirectory $currentVersionDirectory
+                $archivedManifest=Find-CodexArchivedCoreManifest -InstallRoot $installRoot.FullName -VersionDirectory $versionDirectory.FullName -ExecutablePath $path
+                if (-not $archivedManifest) { throw 'The selected historical core has no matching validated package manifest.' }
+                $metadataPath=$archivedManifest
+            }
+        }
+        $identity.MetadataPath = $metadataPath
+        if (Test-CodexPathHasReparsePoint -Path $metadataPath) { throw 'The managed core metadata path contains a reparse point.' }
+
+        $manifest = Get-Content -LiteralPath $metadataPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -Depth 16 -ErrorAction Stop
+        if (-not ($manifest -is [System.Collections.IDictionary]) -or
+            -not ($manifest.validation -is [System.Collections.IDictionary]) -or
+            $manifest.validation.passed -ne $true) {
+            throw 'The managed core metadata has not passed validation.'
+        }
+
+        $rootRelativePath = [IO.Path]::GetRelativePath($installRoot.FullName, $path).Replace('\', '/')
+        $versionRelativePath = [IO.Path]::GetRelativePath($versionDirectory.FullName, $path).Replace('\', '/')
+        $declaredCore = [string]$manifest.coreRelativePath
+        $declaredCoreMatches = $false
+        if (-not [string]::IsNullOrWhiteSpace($declaredCore) -and
+            -not [IO.Path]::IsPathRooted($declaredCore) -and
+            (@($declaredCore -split '[\\/]') -notcontains '..')) {
+            foreach ($base in @($installRoot.FullName, $versionDirectory.FullName)) {
+                $candidate = [IO.Path]::GetFullPath((Join-Path $base $declaredCore.Replace('/', [IO.Path]::DirectorySeparatorChar)))
+                if ($candidate -ieq $path) { $declaredCoreMatches = $true; break }
+            }
+        }
+        if (-not $declaredCoreMatches) { throw 'The managed core metadata does not declare this core path.' }
+
+        $components = @($manifest.components)
+        $matches = @()
+        foreach ($component in $components) {
+            $relativePath = [string]$component.relativePath
+            $componentHash = [string]$component.sha256
+            if ([string]::IsNullOrWhiteSpace($relativePath) -or [IO.Path]::IsPathRooted($relativePath) -or
+                (@($relativePath -split '[\\/]') -contains '..')) { continue }
+            foreach ($base in @($installRoot.FullName, $versionDirectory.FullName)) {
+                $candidate = [IO.Path]::GetFullPath((Join-Path $base $relativePath.Replace('/', [IO.Path]::DirectorySeparatorChar)))
+                if ($candidate -ieq $path) {
+                    $matches += [pscustomobject]@{ Path=$candidate; Sha256=$componentHash }
+                }
+            }
+        }
+        $expectedHashes = @($matches | ForEach-Object { [string]$_.Sha256.ToUpperInvariant() } | Select-Object -Unique)
+        if ($expectedHashes.Count -ne 1 -or $expectedHashes[0] -notmatch '^[A-F0-9]{64}$') {
+            throw 'The managed core metadata is missing a unique SHA-256 component entry.'
+        }
+        $identity.Sha256 = $expectedHashes[0]
+        $identity.Version = if ($manifest.localVersion) { [string]$manifest.localVersion } elseif ($manifest.version) { [string]$manifest.version } else { $versionDirectory.Name }
+        if (-not $SkipHashVerification) {
+            $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+            if ($actualHash -cne $identity.Sha256) { throw 'The managed core hash does not match its validation metadata.' }
+            $identity.HashVerified = $true
+        }
+        $identity.Valid = $true
+        return $identity
+    } catch {
+        $identity.Executable = ''
+        $identity.Error = $_.Exception.Message
+        return $identity
+    }
+}
+
+function Get-CodexAppServerOverride {
+    <# Persisted User settings take precedence over Machine settings. The inherited Process value is intentionally ignored. #>
+    param(
+        [System.Collections.IDictionary]$EnvironmentValues,
+        [switch]$SkipHashVerification
+    )
+
+    $readHostValues = -not $PSBoundParameters.ContainsKey('EnvironmentValues')
+    if ($readHostValues) {
+        $userSelection = Get-CodexPersistedEnvironmentValue -Source User
+        $machineSelection = Get-CodexPersistedEnvironmentValue -Source Machine
+        $EnvironmentValues = [ordered]@{
+            User = $userSelection.Value
+            Machine = $machineSelection.Value
+            UserRawValue = $userSelection.RawValue
+            UserKind = $userSelection.RegistryKind
+            MachineRawValue = $machineSelection.RawValue
+            MachineKind = $machineSelection.RegistryKind
+        }
+    }
+    foreach ($source in @('User', 'Machine')) {
         $value = [string]$EnvironmentValues[$source]
         if ([string]::IsNullOrWhiteSpace($value)) { continue }
         try {
@@ -270,16 +558,37 @@ function Get-CodexAppServerOverride {
             }
             $path = [IO.Path]::GetFullPath($value)
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'The configured codex.exe does not exist.' }
-            return [ordered]@{ Executable=$path; Source=$source; Error=$null }
+            if (Test-CodexPathHasReparsePoint -Path $path) { throw 'The configured core path contains a reparse point.' }
+            $identity = Get-CodexManagedCoreIdentity -ExecutablePath $path -SkipHashVerification:$SkipHashVerification
+            if ($identity.Managed -and -not $identity.Valid) { throw $identity.Error }
+            return [ordered]@{
+                Executable = $path
+                Source = $source
+                Error = $null
+                Managed = [bool]$identity.Managed
+                MetadataValidated = [bool]$identity.Valid
+                HashVerified = [bool]$identity.HashVerified
+                Sha256 = [string]$identity.Sha256
+                Version = [string]$identity.Version
+                MetadataPath = [string]$identity.MetadataPath
+                RawValue = if ($readHostValues) { [string]$EnvironmentValues["${source}RawValue"] } elseif ($EnvironmentValues.Contains("${source}RawValue")) { [string]$EnvironmentValues["${source}RawValue"] } else { $value }
+                RegistryKind = [string]$EnvironmentValues["${source}Kind"]
+            }
         } catch {
-            return [ordered]@{ Executable=''; Source=$source; Error=$_.Exception.Message }
+            return [ordered]@{ Executable=''; Source=$source; Error=$_.Exception.Message; Managed=$false; MetadataValidated=$false; HashVerified=$false; Sha256=''; Version=''; MetadataPath=''; RawValue=$value; RegistryKind='' }
         }
     }
-    return [ordered]@{ Executable=''; Source='None'; Error=$null }
+    return [ordered]@{ Executable=''; Source='None'; Error=$null; Managed=$false; MetadataValidated=$false; HashVerified=$false; Sha256=''; Version=''; MetadataPath=''; RawValue=''; RegistryKind='' }
 }
 
 function Get-CodexPackageInfo {
-    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config,[switch]$SkipCoreHashVerification)
+
+    $appServerOverride = if ($SkipCoreHashVerification) {
+        Get-CodexAppServerOverride -SkipHashVerification
+    } else {
+        Get-CodexAppServerOverride
+    }
 
     $package = Get-AppxPackage -Name $Config.PackageName -ErrorAction SilentlyContinue |
         Sort-Object Version -Descending |
@@ -294,7 +603,7 @@ function Get-CodexPackageInfo {
             DesktopExecutable   = ''
             AppServerExecutable = ''
             AppServerBinRoot    = ''
-            AppServerOverride   = Get-CodexAppServerOverride
+            AppServerOverride   = $appServerOverride
             Aumid               = ''
         }
     }
@@ -327,7 +636,7 @@ function Get-CodexPackageInfo {
         DesktopExecutable   = Join-Path ([string]$package.InstallLocation) 'app\ChatGPT.exe'
         AppServerExecutable = Join-Path ([string]$package.InstallLocation) 'app\resources\codex.exe'
         AppServerBinRoot    = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin' } else { '' }
-        AppServerOverride   = Get-CodexAppServerOverride
+        AppServerOverride   = $appServerOverride
         Aumid               = if ($applicationId) { "$($package.PackageFamilyName)!$applicationId" } else { '' }
     }
 }
@@ -354,8 +663,26 @@ function Test-ProcessDescendsFrom {
     return $false
 }
 
+function Get-CodexRootAncestorId {
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][int[]]$RootIds,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$ProcessById
+    )
+
+    $currentId = $ProcessId
+    $seen = @{}
+    for ($depth = 0; $depth -lt 20; $depth++) {
+        if ($RootIds -contains $currentId) { return $currentId }
+        if ($seen.ContainsKey($currentId) -or -not $ProcessById.Contains($currentId)) { return $null }
+        $seen[$currentId] = $true
+        $currentId = [int]$ProcessById[$currentId].ParentProcessId
+    }
+    return $null
+}
+
 function Test-CodexAppServerExecutablePath {
-    <# .SYNOPSIS Accepts only stock/versioned paths or the exact existing configured core executable. #>
+    <# .SYNOPSIS Accepts the stock package core or the exact current persisted override. #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
         [Parameter(Mandatory)][string]$ExecutablePath
@@ -368,31 +695,27 @@ function Test-CodexAppServerExecutablePath {
             return $false
         }
         if ($Package.AppServerExecutable -and $candidatePath -ieq [IO.Path]::GetFullPath($Package.AppServerExecutable)) { return $true }
-        if ($Package.Contains('AppServerOverride') -and $Package.AppServerOverride.Executable -and
-            $candidatePath -ieq $Package.AppServerOverride.Executable -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) { return $true }
-
-        $binRoot = if ($Package.Contains('AppServerBinRoot')) { [string]$Package.AppServerBinRoot } else { '' }
-        if (-not $binRoot) { return $false }
-
-        $versionDirectory = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName($candidatePath))
-        if (-not $versionDirectory.Name -or $null -eq $versionDirectory.Parent) {
-            return $false
+        if (-not $Package.Contains('AppServerOverride') -or -not $Package.AppServerOverride.Executable -or
+            $Package.AppServerOverride.Error -or $candidatePath -ine $Package.AppServerOverride.Executable -or
+            -not (Test-Path -LiteralPath $candidatePath -PathType Leaf) -or
+            (Test-CodexPathHasReparsePoint -Path $candidatePath)) { return $false }
+        if ($Package.AppServerOverride.Managed) {
+            return [bool]($Package.AppServerOverride.MetadataValidated -and $Package.AppServerOverride.HashVerified)
         }
-
-        $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-        $normalizedBinRoot = [IO.Path]::GetFullPath($binRoot).TrimEnd($separators)
-        $candidateBinRoot = $versionDirectory.Parent.FullName.TrimEnd($separators)
-        return $candidateBinRoot -ieq $normalizedBinRoot
+        # Compatibility for a directly selected, unmanaged exact path is retained,
+        # but it is never eligible for automatic core-switch recovery.
+        return $true
     } catch {
         return $false
     }
 }
 
 function Get-CodexProcessObservation {
-    <# .SYNOPSIS Identifies recognized app servers and fails safely around unknown direct app-server children. #>
+    <# .SYNOPSIS Identifies selected, trusted-previous, stock, and unknown app servers. #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
-        [object[]]$Processes
+        [object[]]$Processes,
+        [System.Collections.IDictionary]$TrustedPreviousCore
     )
 
     if (-not $Package.Found) {
@@ -403,7 +726,13 @@ function Get-CodexProcessObservation {
             UnknownAppServerProcessIds = @()
             UnknownAppServerExecutables = @()
             RootProcessIds      = @()
+            RootProcessIdentities = @()
             AppServerProcessIds = @()
+            AppServerProcessIdentities = @()
+            SelectedCorePresent = $false
+            TrustedPreviousCorePresent = $false
+            CoreSwitchPending = $false
+            CoreSelection = [ordered]@{ Kind='Unavailable'; Path=''; Sha256=''; Version=''; Source='None'; Managed=$false; HashVerified=$false }
             AllPackageProcessIds = @()
             RootStartedUtc      = $null
             AppServerStartedUtc = $null
@@ -426,53 +755,276 @@ function Get-CodexProcessObservation {
         -not $_.CommandLine -or $_.CommandLine -notmatch '(?i)(?:^|\s)--type='
     })
     $rootIds = @($rootProcesses | ForEach-Object { [int]$_.ProcessId })
+    $rootIdentities = @($rootProcesses | ForEach-Object {
+        [ordered]@{
+            processId = [int]$_.ProcessId
+            startedUtc = if ($_.CreationDate) { ConvertTo-UtcString $_.CreationDate } else { '' }
+            executablePath = [string]$_.ExecutablePath
+        }
+    })
+
+    $override = if ($Package.Contains('AppServerOverride')) { $Package.AppServerOverride } else { $null }
+    $coreSelection = if ($override -and $override.Error) {
+        [ordered]@{ Kind='Invalid'; Path=''; Sha256=''; Version=''; Source=[string]$override.Source; Managed=$false; HashVerified=$false }
+    } elseif ($override -and $override.Executable) {
+        [ordered]@{
+            Kind = if ($override.Managed) { 'Managed' } else { 'Legacy' }
+            Path = [string]$override.Executable
+            Sha256 = [string]$override.Sha256
+            Version = [string]$override.Version
+            Source = [string]$override.Source
+            Managed = [bool]$override.Managed
+            HashVerified = [bool]$override.HashVerified
+            RawValue = [string](Get-JsonPropertyValue -Object $override -Name 'RawValue')
+        }
+    } else {
+        [ordered]@{
+            Kind = 'Stock'
+            Path = [string]$Package.AppServerExecutable
+            Sha256 = ''
+            Version = if ($Package.Contains('Version')) { [string]$Package.Version } else { '' }
+            Source = 'None'
+            Managed = $false
+            HashVerified = $true
+            RawValue = ''
+        }
+    }
 
     $appServerRoleProcesses = @($Processes | Where-Object {
         $_.Name -ieq 'codex.exe' -and
-        $_.CommandLine -match '(?i)(?:^|\s)app-server(?:\s|$)'
+        ((Get-JsonPropertyValue -Object $_ -Name 'CommandLine') -match '(?i)(?:^|\s)app-server(?:\s|$)' -or
+         [string]::IsNullOrWhiteSpace([string](Get-JsonPropertyValue -Object $_ -Name 'CommandLine')))
     })
-    $appServerCandidates = @($appServerRoleProcesses | Where-Object {
-        $_.ExecutablePath -and (Test-CodexAppServerExecutablePath -Package $Package -ExecutablePath $_.ExecutablePath)
-    })
-    $appServers = @($appServerCandidates | Where-Object {
-        $rootIds.Count -gt 0 -and (Test-ProcessDescendsFrom -ProcessId ([int]$_.ParentProcessId) -AncestorIds $rootIds -ProcessById $processById)
-    })
-    $appServerIds = @($appServers | ForEach-Object { [int]$_.ProcessId })
-    # A changed override or unreadable executable is uncertainty, not a missing server.
-    # Only direct children of the exact installed main process receive this protection;
-    # unrelated CLI servers and nested agent tool invocations do not.
-    $unknownAppServers = @($appServerRoleProcesses | Where-Object {
-        [int]$_.ParentProcessId -in $rootIds -and [int]$_.ProcessId -notin $appServerIds
-    })
+    $appServerIdentities = @()
+    $selectedIds = @()
+    $previousIds = @()
+    $unknownAppServers = @()
+    $previousCore = $TrustedPreviousCore
+    $previousCoreRecord = if ($previousCore -and $previousCore.Contains('core')) { $previousCore.core } else { $null }
+    $previousProcessRecord = if ($previousCore -and $previousCore.Contains('process')) { $previousCore.process } else { $null }
+    $previousDiffersFromSelected = $false
+    if ($previousCoreRecord -and $coreSelection.Path -and
+        ([string]$previousCoreRecord.path -ine [string]$coreSelection.Path -or
+         ([string]$previousCoreRecord.sha256).ToUpperInvariant() -cne ([string]$coreSelection.Sha256).ToUpperInvariant())) {
+        $previousDiffersFromSelected = $true
+    } elseif ($previousCoreRecord -and $coreSelection.Kind -eq 'Stock' -and
+        [string]$previousCoreRecord.path -ine [string]$coreSelection.Path) {
+        $previousDiffersFromSelected = $true
+    }
 
-    $allPackageIds = @($Processes | Where-Object {
-        $_.ExecutablePath -and (
-            $_.ExecutablePath -ieq $Package.DesktopExecutable -or
-            $_.ExecutablePath -ieq $Package.AppServerExecutable -or
-            $appServerIds -contains [int]$_.ProcessId
-        )
-    } | ForEach-Object { [int]$_.ProcessId })
+    foreach ($process in $appServerRoleProcesses) {
+        $processId = [int]$process.ProcessId
+        $processCreationDate = Get-JsonPropertyValue -Object $process -Name 'CreationDate'
+        $isDescendant = $rootIds.Count -gt 0 -and
+            (Test-ProcessDescendsFrom -ProcessId ([int]$process.ParentProcessId) -AncestorIds $rootIds -ProcessById $processById)
+        $hasServerRole = [string](Get-JsonPropertyValue -Object $process -Name 'CommandLine') -match '(?i)(?:^|\s)app-server(?:\s|$)'
+        $isSelected = $isDescendant -and $hasServerRole -and $process.ExecutablePath -and
+            (Test-CodexAppServerExecutablePath -Package $Package -ExecutablePath ([string]$process.ExecutablePath))
+        $isTrustedPrevious = $false
+        $desktopAncestorId = if ($isDescendant) {
+            Get-CodexRootAncestorId -ProcessId ([int]$process.ParentProcessId) -RootIds $rootIds -ProcessById $processById
+        } else { $null }
+        $desktopIdentity = $rootIdentities | Where-Object { [int]$_.processId -eq [int]$desktopAncestorId } | Select-Object -First 1
+        if (-not $isSelected -and $isDescendant -and $previousDiffersFromSelected -and $previousCoreRecord -and $previousProcessRecord -and
+            [int]$previousProcessRecord.pid -eq $processId -and
+            [string]$previousCoreRecord.path -and $process.ExecutablePath -ieq [string]$previousCoreRecord.path -and
+            $previousProcessRecord.startUtc -and $processCreationDate -and $desktopIdentity -and
+            [int]$previousProcessRecord.desktopPid -eq [int]$desktopIdentity.processId -and
+            [string]$previousProcessRecord.desktopStartUtc -ceq [string]$desktopIdentity.startedUtc) {
+            try {
+                $isTrustedPrevious = (ConvertTo-UtcString $processCreationDate) -ceq [string]$previousProcessRecord.startUtc
+                if ($isTrustedPrevious -and [string]$previousCoreRecord.kind -eq 'Managed') {
+                    if (-not [string]$previousCoreRecord.sha256 -or (Test-CodexPathHasReparsePoint -Path ([string]$process.ExecutablePath))) {
+                        $isTrustedPrevious = $false
+                    } else {
+                        $actualPreviousHash = (Get-FileHash -LiteralPath ([string]$process.ExecutablePath) -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+                        $isTrustedPrevious = $actualPreviousHash -ceq ([string]$previousCoreRecord.sha256).ToUpperInvariant()
+                    }
+                } elseif ($isTrustedPrevious -and [string]$previousCoreRecord.kind -eq 'Stock') {
+                    $isTrustedPrevious = $process.ExecutablePath -ieq [string]$previousCoreRecord.path
+                } else {
+                    # A prior unmanaged exact override can still be recognized while
+                    # selected, but it does not authorize an automatic core switch.
+                    $isTrustedPrevious = $false
+                }
+            } catch {
+                $isTrustedPrevious = $false
+            }
+        }
+
+        if ($isSelected -or $isTrustedPrevious) {
+            $classification = if ($isTrustedPrevious) { 'TrustedPrevious' } elseif ($coreSelection.Kind -eq 'Stock') { 'Stock' } elseif ($coreSelection.Kind -eq 'Legacy') { 'Legacy' } else { 'Selected' }
+            $serverIdentity = [ordered]@{
+                processId = $processId
+                parentProcessId = [int]$process.ParentProcessId
+                startedUtc = if ($processCreationDate) { ConvertTo-UtcString $processCreationDate } else { '' }
+                executablePath = [string]$process.ExecutablePath
+                desktopProcessId = if ($desktopIdentity) { [int]$desktopIdentity.processId } else { 0 }
+                desktopStartedUtc = if ($desktopIdentity) { [string]$desktopIdentity.startedUtc } else { '' }
+                coreKind = if ($isTrustedPrevious) { [string]$previousCoreRecord.kind } else { [string]$coreSelection.Kind }
+                coreSha256 = if ($isTrustedPrevious) { [string]$previousCoreRecord.sha256 } else { [string]$coreSelection.Sha256 }
+                coreVersion = if ($isTrustedPrevious) { [string]$previousCoreRecord.version } else { [string]$coreSelection.Version }
+                classification = $classification
+            }
+            $appServerIdentities += $serverIdentity
+            if ($isSelected) { $selectedIds += $processId }
+            if ($isTrustedPrevious) { $previousIds += $processId }
+        } elseif ([int]$process.ParentProcessId -in $rootIds) {
+            # Unknown direct children block recovery; nested CLI/tool processes do not.
+            $unknownAppServers += $process
+        }
+    }
+    $appServerIds = @($appServerIdentities | ForEach-Object { [int]$_.processId } | Select-Object -Unique)
+
+    $allPackageIds = @(@($rootIds) + @($appServerIds) | Select-Object -Unique)
     $rootStartTimes = @($rootProcesses | ForEach-Object {
         $value = Get-JsonPropertyValue -Object $_ -Name 'CreationDate'
         if ($value) { ConvertTo-UtcDateTimeOffset $value }
     } | Sort-Object)
-    $appServerStartTimes = @($appServers | ForEach-Object {
-        $value = Get-JsonPropertyValue -Object $_ -Name 'CreationDate'
-        if ($value) { ConvertTo-UtcDateTimeOffset $value }
+    $appServerStartTimes = @($appServerIdentities | Where-Object { $_.startedUtc } | ForEach-Object {
+        ConvertTo-UtcDateTimeOffset $_.startedUtc
     } | Sort-Object)
 
     return [ordered]@{
         DesktopPresent       = $rootIds.Count -gt 0
-        AppServerPresent     = $appServers.Count -gt 0
-        AppServerStatus      = if ($unknownAppServers.Count -gt 0) { 'Unknown' } elseif ($appServers.Count -gt 0) { 'Recognized' } else { 'Missing' }
+        AppServerPresent     = $appServerIds.Count -gt 0
+        AppServerStatus      = if ($unknownAppServers.Count -gt 0) { 'Unknown' } elseif ($appServerIds.Count -gt 0) { 'Recognized' } else { 'Missing' }
         UnknownAppServerProcessIds = @($unknownAppServers | ForEach-Object { [int]$_.ProcessId })
         UnknownAppServerExecutables = @($unknownAppServers | ForEach-Object { [string]$_.ExecutablePath })
         RootProcessIds       = $rootIds
+        RootProcessIdentities = $rootIdentities
         AppServerProcessIds  = $appServerIds
+        AppServerProcessIdentities = $appServerIdentities
+        SelectedCorePresent = $selectedIds.Count -gt 0
+        TrustedPreviousCorePresent = $previousIds.Count -gt 0
+        CoreSwitchPending = [bool]($previousDiffersFromSelected -and $coreSelection.Managed -and $rootIds.Count -gt 0 -and
+            ($previousIds.Count -gt 0 -or $selectedIds.Count -eq 0))
+        CoreSelection = $coreSelection
         AllPackageProcessIds = $allPackageIds
         RootStartedUtc       = if ($rootStartTimes.Count -gt 0) { $rootStartTimes[0] } else { $null }
         AppServerStartedUtc  = if ($appServerStartTimes.Count -gt 0) { $appServerStartTimes[0] } else { $null }
     }
+}
+
+function Get-VerifiedCodexProcessHandle {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Identity)
+
+    try {
+        $fresh = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$Identity.processId)" -ErrorAction Stop
+        if (-not $fresh -or [int]$fresh.ProcessId -ne [int]$Identity.processId -or
+            -not $fresh.ExecutablePath -or [string]$fresh.ExecutablePath -ine [string]$Identity.executablePath -or
+            -not $fresh.CreationDate -or (ConvertTo-UtcString $fresh.CreationDate) -cne [string]$Identity.startedUtc) { return $null }
+        if ([string]$Identity.coreKind -eq 'Managed') {
+            if (-not [string]$Identity.coreSha256 -or (Test-CodexPathHasReparsePoint -Path ([string]$Identity.executablePath)) -or
+                (Get-FileHash -LiteralPath ([string]$Identity.executablePath) -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant() -cne ([string]$Identity.coreSha256).ToUpperInvariant()) { return $null }
+        }
+        $handle = Get-Process -Id ([int]$Identity.processId) -ErrorAction Stop
+        if (-not $handle.StartTime -or
+            [Math]::Abs(($handle.StartTime.ToUniversalTime() - (ConvertTo-UtcDateTimeOffset $Identity.startedUtc).UtcDateTime).TotalSeconds) -gt 2) {
+            $handle.Dispose()
+            return $null
+        }
+        return $handle
+    } catch {
+        return $null
+    }
+}
+
+function Get-FreshSafeCodexProcessIdentity {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Identity,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [System.Collections.IDictionary]$TrustedPreviousCore,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$ExpectedCore
+    )
+
+    $package = Get-CodexPackageInfo -Config $Config
+    if (-not $package.Found) { throw 'Codex disappeared before the process could be acted on.' }
+    $selection = Get-CodexDesiredCoreIdentity -Package $package
+    if (-not (Test-CodexCoreSelectionMatches -Actual $selection -Expected $ExpectedCore)) {
+        throw 'The persisted core selection changed before the process could be acted on.'
+    }
+    $observation = Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
+    if ($observation.AppServerStatus -eq 'Unknown') {
+        throw 'An unrecognized live Codex app-server was found; refusing to close or stop the application.'
+    }
+    $identities = @($observation.RootProcessIdentities) + @($observation.AppServerProcessIdentities)
+    return $identities | Where-Object {
+        $observedKind = [string](Get-JsonPropertyValue -Object $_ -Name 'coreKind')
+        $observedHash = [string](Get-JsonPropertyValue -Object $_ -Name 'coreSha256')
+        $expectedHash = [string](Get-JsonPropertyValue -Object $Identity -Name 'coreSha256')
+        [int]$_.processId -eq [int]$Identity.processId -and
+        [string]$_.startedUtc -ceq [string]$Identity.startedUtc -and
+        [string]$_.executablePath -ieq [string]$Identity.executablePath -and
+        ($observedKind -cne 'Managed' -or $observedHash.ToUpperInvariant() -ceq $expectedHash.ToUpperInvariant())
+    } | Select-Object -First 1
+}
+
+function Test-CodexCoreSelectionMatches {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Actual,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Expected
+    )
+
+    if (-not $Actual.Path -or -not $Expected.Path -or [string]$Actual.Path -ine [string]$Expected.Path) { return $false }
+    if ([string]$Actual.Source -cne [string]$Expected.Source) { return $false }
+    if ([bool]$Expected.Managed) {
+        return [bool]($Actual.Managed -and $Actual.HashVerified -and $Expected.HashVerified -and
+            [string]$Actual.Sha256 -match '^[A-Fa-f0-9]{64}$' -and
+            ([string]$Actual.Sha256).ToUpperInvariant() -ceq ([string]$Expected.Sha256).ToUpperInvariant())
+    }
+    return [bool](-not $Actual.Managed -and ([string]$Actual.Sha256).ToUpperInvariant() -ceq ([string]$Expected.Sha256).ToUpperInvariant())
+}
+
+function Set-LastHealthyCoreFromObservation {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$State,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][DateTimeOffset]$Now
+    )
+
+    if (-not $Observation.Package.Found -or -not $Observation.Integrity.Healthy -or
+        $Observation.Enrollment.Status -ne 'Enabled' -or $Observation.Remote.ManualCondition -or
+        -not $Observation.Process.DesktopPresent -or -not $Observation.Process.SelectedCorePresent -or
+        $Observation.Process.AppServerStatus -ne 'Recognized' -or $Observation.Process.CoreSwitchPending) {
+        return $false
+    }
+
+    $active = @($Observation.Process.AppServerProcessIdentities |
+        Where-Object { $_.classification -in @('Selected','Stock','Legacy') } |
+        Select-Object -First 1)
+    if ($active.Count -eq 0 -or -not $active[0].startedUtc -or [int]$active[0].desktopProcessId -le 0 -or
+        -not $active[0].desktopStartedUtc -or -not $Observation.Process.CoreSelection.Path) { return $false }
+
+    $selection = $Observation.Process.CoreSelection
+    if ($selection.Managed -and (-not $selection.HashVerified -or [string]$selection.Sha256 -notmatch '^[A-Fa-f0-9]{64}$')) { return $false }
+    $State.lastHealthyCore = [ordered]@{
+        selector = [ordered]@{
+            source=[string]$selection.Source;path=[string]$selection.Path
+            rawValue=[string]$selection.RawValue
+            registryKind=if ($Observation.Package.Contains('AppServerOverride')) { [string](Get-JsonPropertyValue -Object $Observation.Package.AppServerOverride -Name 'RegistryKind') } else { '' }
+        }
+        core = [ordered]@{
+            kind = [string]$selection.Kind
+            path = [string]$selection.Path
+            sha256 = [string]$selection.Sha256
+            version = [string]$selection.Version
+        }
+        process = [ordered]@{
+            pid = [int]$active[0].processId
+            startUtc = [string]$active[0].startedUtc
+            desktopPid = [int]$active[0].desktopProcessId
+            desktopStartUtc = [string]$active[0].desktopStartedUtc
+        }
+        healthyAtUtc = $Now.ToString('o')
+    }
+
+    $attempt = $State.coreSwitchAttempt
+    if ($attempt -and $attempt.target -and [string]$attempt.target.path -ieq [string]$selection.Path -and
+        ([string]$attempt.target.sha256).ToUpperInvariant() -ceq ([string]$selection.Sha256).ToUpperInvariant()) {
+        $State.coreSwitchAttempt = $null
+    }
+    return $true
 }
 
 function Get-CodexDatabasePaths {
@@ -685,6 +1237,7 @@ function Get-JsonPropertyValue {
         [Parameter(Mandatory)][string]$Name
     )
     if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary] -and $Object.Contains($Name)) { return $Object[$Name] }
     $property = $Object.PSObject.Properties[$Name]
     if ($property) { return $property.Value }
     return $null
@@ -1077,7 +1630,8 @@ function Get-RecoveryValidationReport {
         [Parameter(Mandatory)][System.Collections.IDictionary]$AfterPackage,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Process,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Integrity,
-        [Parameter(Mandatory)][System.Collections.IDictionary]$Enrollment
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Enrollment,
+        [System.Collections.IDictionary]$ExpectedCore
     )
 
     $checks = @(
@@ -1090,6 +1644,12 @@ function Get-RecoveryValidationReport {
     )
     if ($Process.Contains('AppServerStatus') -and $Process.AppServerStatus -eq 'Unknown') {
         $checks += New-ValidationCheck -Name 'AppServerExecutableRecognized' -Status 'failed' -Expected 'A recognized app-server executable' -Observed $Process.UnknownAppServerExecutables
+    }
+    if ($ExpectedCore) {
+        $matchesDesired = $Process.Contains('CoreSelection') -and
+            (Test-CodexCoreSelectionMatches -Actual $Process.CoreSelection -Expected $ExpectedCore) -and
+            $Process.SelectedCorePresent -and $Process.AppServerStatus -eq 'Recognized'
+        $checks += New-ValidationCheck -Name 'SelectedCoreMatchesDesired' -Status $(if ($matchesDesired) { 'passed' } else { 'failed' }) -Expected ([ordered]@{source=$ExpectedCore.Source;path=$ExpectedCore.Path;sha256=$ExpectedCore.Sha256}) -Observed ([ordered]@{source=$Process.CoreSelection.Source;path=$Process.CoreSelection.Path;sha256=$Process.CoreSelection.Sha256})
     }
     return [ordered]@{
         phase                = 'postRecovery'
@@ -1113,6 +1673,9 @@ function Get-WatchdogDecision {
 
     if (-not $Observation.Package.Found) {
         return New-WatchdogDecision -Action 'Manual' -Reason 'CodexPackageNotFound'
+    }
+    if ($Observation.Package.Contains('AppServerOverride') -and $Observation.Package.AppServerOverride.Error) {
+        return New-WatchdogDecision -Action 'Manual' -Reason 'SelectedCoreInvalid'
     }
     if (-not $Observation.Integrity.Healthy) {
         return New-WatchdogDecision -Action 'Manual' -Reason 'DatabaseIntegrityNotHealthy'
@@ -1146,6 +1709,27 @@ function Get-WatchdogDecision {
         $State.appServerMissingChecks = 0
         return New-WatchdogDecision -Action 'Manual' -Reason 'UnrecognizedAppServer'
     }
+    $protectors = @($Observation.Threads | Where-Object Status -in @('Healthy', 'Starting', 'ToolRunning', 'WaitingForInput'))
+    $preDispatch = @($Observation.Threads | Where-Object Status -eq 'PreDispatchFreeze')
+
+    if ($Observation.Process.Contains('CoreSwitchPending') -and $Observation.Process.CoreSwitchPending) {
+        $State.appServerMissingSinceUtc = $null
+        $State.appServerMissingChecks = 0
+        $attempt = $State.coreSwitchAttempt
+        $selection = $Observation.Process.CoreSelection
+        $sameAttempt = $attempt -and $attempt.target -and
+            [string]$attempt.target.path -ieq [string]$selection.Path -and
+            ([string]$attempt.target.sha256).ToUpperInvariant() -ceq ([string]$selection.Sha256).ToUpperInvariant() -and
+            [string]$attempt.target.source -ceq [string]$selection.Source
+        if ($sameAttempt -and [string]$attempt.status -in @('Attempting', 'RollbackAttempted', 'Failed')) {
+            return New-WatchdogDecision -Action 'Manual' -Reason 'CoreSwitchAttemptAlreadyUsed'
+        }
+        if ($protectors.Count -gt 0) {
+            return New-WatchdogDecision -Action 'None' -Reason 'HealthyTaskProtectsSharedApp' -ProtectedByThreadIds @($protectors | ForEach-Object ThreadId)
+        }
+        if ($suppression) { return New-WatchdogDecision -Action 'None' -Reason $suppression }
+        return New-WatchdogDecision -Action 'Restart' -Reason 'CoreSelectionChanged'
+    }
     if (-not $Observation.Process.AppServerPresent) {
         if (-not $State.appServerMissingSinceUtc) {
             $State.appServerMissingSinceUtc = $Now.ToString('o')
@@ -1164,8 +1748,6 @@ function Get-WatchdogDecision {
 
     $State.appServerMissingSinceUtc = $null
     $State.appServerMissingChecks = 0
-    $protectors = @($Observation.Threads | Where-Object Status -in @('Healthy', 'Starting', 'ToolRunning', 'WaitingForInput'))
-    $preDispatch = @($Observation.Threads | Where-Object Status -eq 'PreDispatchFreeze')
 
     if ($preDispatch.Count -gt 0) {
         $suspectIds = @($preDispatch | ForEach-Object ThreadId)
@@ -1208,7 +1790,7 @@ function Get-CodexObservation {
     )
 
     $package = Get-CodexPackageInfo -Config $Config
-    $process = Get-CodexProcessObservation -Package $package
+    $process = Get-CodexProcessObservation -Package $package -TrustedPreviousCore $State.lastHealthyCore
     $databases = Get-CodexDatabasePaths -Config $Config
     $integrity = Test-CodexDatabaseIntegrity -DatabasePaths $databases
     $enrollment = Get-RemoteEnrollmentObservation -DatabasePaths $databases
@@ -1314,11 +1896,39 @@ function Start-CodexDesktop {
     )
     $plan = if ($LaunchPlan) { $LaunchPlan } else { Get-CodexDesktopLaunchPlan -Package $Package -UserHome $UserHome }
     if (-not $plan.CanLaunch) { throw $plan.Error }
-    if ($plan.Mode -eq 'Enhanced') {
-        $launcher = Start-Process -FilePath $plan.Executable -ArgumentList $plan.Arguments -WorkingDirectory $plan.WorkingDirectory -WindowStyle Hidden -PassThru -ErrorAction Stop
-        return [ordered]@{ Mode='Enhanced'; LauncherPath=$plan.LauncherPath; LauncherProcessId=$launcher.Id }
+    $override = Get-CodexAppServerOverride
+    if ($override.Error) { throw 'The persisted CODEX_CLI_PATH is invalid; refusing to launch with a stale inherited selection.' }
+    $priorProcessValue = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Process')
+    $hadProcessValue = [Environment]::GetEnvironmentVariables('Process').Contains('CODEX_CLI_PATH')
+    $setChildSelection = {
+        if ($override.Executable) {
+            [Environment]::SetEnvironmentVariable('CODEX_CLI_PATH',[string]$override.Executable,'Process')
+        } else {
+            Remove-Item -LiteralPath 'Env:\CODEX_CLI_PATH' -ErrorAction SilentlyContinue
+        }
     }
-    Invoke-CodexNativeActivation -Package $Package
+    $restoreProcessSelection = {
+        if ($hadProcessValue) {
+            [Environment]::SetEnvironmentVariable('CODEX_CLI_PATH',$priorProcessValue,'Process')
+        } else {
+            Remove-Item -LiteralPath 'Env:\CODEX_CLI_PATH' -ErrorAction SilentlyContinue
+        }
+    }
+    if ($plan.Mode -eq 'Enhanced') {
+        try {
+            & $setChildSelection
+            $launcher = Start-Process -FilePath $plan.Executable -ArgumentList $plan.Arguments -WorkingDirectory $plan.WorkingDirectory -WindowStyle Hidden -PassThru -ErrorAction Stop
+            return [ordered]@{ Mode='Enhanced'; LauncherPath=$plan.LauncherPath; LauncherProcessId=$launcher.Id }
+        } finally {
+            & $restoreProcessSelection
+        }
+    }
+    try {
+        & $setChildSelection
+        Invoke-CodexNativeActivation -Package $Package
+    } finally {
+        & $restoreProcessSelection
+    }
     return [ordered]@{ Mode='Native'; LauncherPath=$null; LauncherProcessId=$null }
 }
 
@@ -1388,31 +1998,58 @@ function Stop-CodexPackageProcesses {
     <# .SYNOPSIS Stops recognized package processes only when no unknown live direct app server is present. #>
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
-        [Parameter(Mandatory)][System.Collections.IDictionary]$Config
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [System.Collections.IDictionary]$TrustedPreviousCore,
+        [System.Collections.IDictionary]$ExpectedCore
     )
 
-    $observation = Get-CodexProcessObservation -Package $Package
+    if (-not $ExpectedCore) { $ExpectedCore = Get-CodexDesiredCoreIdentity -Package $Package }
+    $observation = Get-CodexProcessObservation -Package $Package -TrustedPreviousCore $TrustedPreviousCore
     if ($observation.AppServerStatus -eq 'Unknown') { throw 'An unrecognized live Codex app-server was found; refusing to close or stop the application.' }
-    foreach ($rootId in @($observation.RootProcessIds)) {
-        try {
-            $process = Get-Process -Id $rootId -ErrorAction Stop
-            [void]$process.CloseMainWindow()
-        } catch {
-            # The process may already have exited.
+    foreach ($identity in @($observation.RootProcessIdentities)) {
+        $freshIdentity = Get-FreshSafeCodexProcessIdentity -Identity $identity -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
+        if ($freshIdentity) {
+            $process = Get-VerifiedCodexProcessHandle -Identity $freshIdentity
+            if ($process) {
+                try {
+                    $stillSafe = Get-FreshSafeCodexProcessIdentity -Identity $freshIdentity -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
+                    if ($stillSafe) { [void]$process.CloseMainWindow() }
+                } finally { $process.Dispose() }
+            }
         }
     }
 
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($Config.GracefulShutdownSeconds)
     do {
         Start-Sleep -Milliseconds 500
-        $remaining = Get-CodexProcessObservation -Package $Package
+        $livePackage = Get-CodexPackageInfo -Config $Config
+        if (-not $livePackage.Found) { throw 'Codex disappeared before shutdown completed.' }
+        if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $livePackage) -Expected $ExpectedCore)) {
+            throw 'The persisted core selection changed during shutdown.'
+        }
+        $remaining = Get-CodexProcessObservation -Package $livePackage -TrustedPreviousCore $TrustedPreviousCore
         if ($remaining.AllPackageProcessIds.Count -eq 0) { return }
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
 
-    $remaining = Get-CodexProcessObservation -Package $Package
+    $livePackage = Get-CodexPackageInfo -Config $Config
+    if (-not $livePackage.Found) { throw 'Codex disappeared before force-stop.' }
+    if (-not (Test-CodexCoreSelectionMatches -Actual (Get-CodexDesiredCoreIdentity -Package $livePackage) -Expected $ExpectedCore)) {
+        throw 'The persisted core selection changed before force-stop.'
+    }
+    $remaining = Get-CodexProcessObservation -Package $livePackage -TrustedPreviousCore $TrustedPreviousCore
     if ($remaining.AppServerStatus -eq 'Unknown') { throw 'An unrecognized live Codex app-server appeared; refusing to force-stop the application.' }
-    foreach ($processId in @($remaining.AllPackageProcessIds)) {
-        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    $killIdentities = @($remaining.RootProcessIdentities) + @($remaining.AppServerProcessIdentities)
+    foreach ($identity in $killIdentities) {
+        $freshIdentity = Get-FreshSafeCodexProcessIdentity -Identity $identity -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
+        if ($freshIdentity) {
+            $process = Get-VerifiedCodexProcessHandle -Identity $freshIdentity
+            if ($process) {
+                try {
+                    $stillSafe = Get-FreshSafeCodexProcessIdentity -Identity $freshIdentity -Config $Config -TrustedPreviousCore $TrustedPreviousCore -ExpectedCore $ExpectedCore
+                    if ($stillSafe) { $process.Kill() }
+                } catch { } finally { $process.Dispose() }
+            }
+        }
     }
 }
 
@@ -1420,22 +2057,179 @@ function Wait-CodexHealthyProcesses {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
         [Parameter(Mandatory)][System.Collections.IDictionary]$InitialPackage,
-        [Parameter(Mandatory)][int]$TimeoutSeconds
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$ExpectedCore,
+        [System.Collections.IDictionary]$TrustedPreviousCore
     )
 
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Seconds 2
         $package = Get-CodexPackageInfo -Config $Config
-        if (-not $package.Found) { $package = $InitialPackage }
-        $process = Get-CodexProcessObservation -Package $package
-        if ($process.DesktopPresent -and $process.AppServerPresent -and $process.AppServerStatus -ne 'Unknown') {
-            return [ordered]@{ Package = $package; Process = $process }
+        if (-not $package.Found) { continue }
+        $process = Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
+        $identityMatches = $process.CoreSelection -and (Test-CodexCoreSelectionMatches -Actual $process.CoreSelection -Expected $ExpectedCore)
+        if ($identityMatches -and $process.DesktopPresent -and $process.SelectedCorePresent -and
+            -not $process.TrustedPreviousCorePresent -and $process.AppServerStatus -eq 'Recognized') {
+            return [ordered]@{ Package=$package; Process=$process; Ready=$true }
         }
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
     $package = Get-CodexPackageInfo -Config $Config
-    if (-not $package.Found) { $package = $InitialPackage }
-    return [ordered]@{ Package = $package; Process = (Get-CodexProcessObservation -Package $package) }
+    if (-not $package.Found) { return [ordered]@{Package=$package;Process=(Get-CodexProcessObservation -Package $package);Ready=$false} }
+    $process = Get-CodexProcessObservation -Package $package -TrustedPreviousCore $TrustedPreviousCore
+    $matches = $process.CoreSelection -and (Test-CodexCoreSelectionMatches -Actual $process.CoreSelection -Expected $ExpectedCore)
+    $ready = [bool]($matches -and $process.DesktopPresent -and $process.SelectedCorePresent -and
+        -not $process.TrustedPreviousCorePresent -and $process.AppServerStatus -eq 'Recognized')
+    return [ordered]@{ Package=$package; Process=$process; Ready=$ready }
+}
+
+function Get-CodexDesiredCoreIdentity {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Package)
+    $override = if ($Package.Contains('AppServerOverride')) { $Package.AppServerOverride } else { $null }
+    if ($override -and $override.Error) { throw 'The persisted CODEX_CLI_PATH is invalid.' }
+    if ($override -and $override.Executable) {
+        return [ordered]@{
+            Kind=if ($override.Managed) { 'Managed' } else { 'Legacy' }
+            Path=[string]$override.Executable;Sha256=[string]$override.Sha256;Version=[string]$override.Version
+            Source=[string]$override.Source;Managed=[bool]$override.Managed;HashVerified=[bool]$override.HashVerified;RawValue=[string](Get-JsonPropertyValue -Object $override -Name 'RawValue')
+        }
+    }
+    return [ordered]@{
+        Kind='Stock';Path=[string]$Package.AppServerExecutable;Sha256='';Version=$(if ($Package.Contains('Version')) { [string]$Package.Version } else { '' })
+        Source='None';Managed=$false;HashVerified=$true;RawValue=''
+    }
+}
+
+function Get-CoreSelectionRollbackPlan {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Attempt,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$LastHealthyCore,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentValues
+    )
+
+    $target = $Attempt.target
+    $previousSelector = $LastHealthyCore.selector
+    $previousCore = $LastHealthyCore.core
+    if (-not $target) { return [ordered]@{ CanRollback=$false;Reason='TargetSelectionMissing';UserValue=$null;RegistryKind='' } }
+    $targetValue = if ($target.Contains('rawValue') -and $target.rawValue) { [string]$target.rawValue } else { [string]$target.path }
+    $currentUserValue = if ($EnvironmentValues.Contains('UserRawValue') -and $EnvironmentValues.UserRawValue) { [string]$EnvironmentValues.UserRawValue } else { [string]$EnvironmentValues.User }
+    if (-not $target -or [string]$target.source -cne 'User' -or
+        $currentUserValue -ine $targetValue) {
+        return [ordered]@{ CanRollback=$false;Reason='SelectedValueChanged';UserValue=$null;RegistryKind='' }
+    }
+    if (-not $previousSelector -or -not $previousCore.path -or -not (Test-Path -LiteralPath ([string]$previousCore.path) -PathType Leaf) -or
+        (Test-CodexPathHasReparsePoint -Path ([string]$previousCore.path))) {
+        return [ordered]@{ CanRollback=$false;Reason='PreviousCoreUnavailable';UserValue=$null;RegistryKind='' }
+    }
+    if ([string]$previousCore.kind -eq 'Managed') {
+        try {
+            $previousHash = (Get-FileHash -LiteralPath ([string]$previousCore.path) -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+            if (-not [string]$previousCore.sha256 -or $previousHash -cne ([string]$previousCore.sha256).ToUpperInvariant()) {
+                return [ordered]@{ CanRollback=$false;Reason='PreviousCoreHashChanged';UserValue=$null;RegistryKind='' }
+            }
+        } catch { return [ordered]@{ CanRollback=$false;Reason='PreviousCoreUnavailable';UserValue=$null;RegistryKind='' } }
+    }
+    switch ([string]$previousSelector.source) {
+        'User' {
+            if ([string]$previousSelector.path -ine [string]$previousCore.path) { return [ordered]@{ CanRollback=$false;Reason='PreviousSelectorMismatch';UserValue=$null;RegistryKind='' } }
+            $previousValue = if ($previousSelector.Contains('rawValue') -and $previousSelector.rawValue) { [string]$previousSelector.rawValue } else { [string]$previousSelector.path }
+            $previousKind = if ($previousSelector.Contains('registryKind')) { [string]$previousSelector.registryKind } else { '' }
+            return [ordered]@{ CanRollback=$true;Reason='VerifiedPreviousUserSelector';UserValue=$previousValue;RegistryKind=$previousKind }
+        }
+        'Machine' {
+            if ([string]$EnvironmentValues.Machine -ine [string]$previousSelector.path -or
+                [string]$previousSelector.path -ine [string]$previousCore.path) { return [ordered]@{ CanRollback=$false;Reason='MachineSelectorChanged';UserValue=$null;RegistryKind='' } }
+            return [ordered]@{ CanRollback=$true;Reason='RestoreMachineSelector';UserValue=$null;RegistryKind='' }
+        }
+        'None' {
+            if (-not [string]::IsNullOrWhiteSpace([string]$EnvironmentValues.Machine) -or
+                ([string]$previousSelector.path -and [string]$previousSelector.path -ine [string]$previousCore.path)) {
+                return [ordered]@{ CanRollback=$false;Reason='MachineSelectorChanged';UserValue=$null;RegistryKind='' }
+            }
+            return [ordered]@{ CanRollback=$true;Reason='RestoreStockSelector';UserValue=$null;RegistryKind='' }
+        }
+        default { return [ordered]@{ CanRollback=$false;Reason='PreviousSelectorUnverified';UserValue=$null;RegistryKind='' } }
+    }
+}
+
+function Set-PersistedUserCodexSelection {
+    param([AllowNull()][string]$Value,[string]$RegistryKind)
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    try {
+        if ($null -eq $Value) {
+            $key.DeleteValue('CODEX_CLI_PATH',$false)
+        } else {
+            $kind = [Microsoft.Win32.RegistryValueKind]::String
+            if ($RegistryKind -in @('String','ExpandString')) { $kind = [Enum]::Parse([Microsoft.Win32.RegistryValueKind],$RegistryKind) }
+            $key.SetValue('CODEX_CLI_PATH',$Value,$kind)
+        }
+    } finally { if ($key) { $key.Dispose() } }
+}
+
+function Invoke-CoreSelectionRollback {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$State,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Attempt,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$CurrentPackage,
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [System.Collections.IDictionary]$EnvironmentValues
+    )
+
+    if (-not $CurrentPackage.Found) { return [ordered]@{Attempted=$false;Successful=$false;Reason='CodexPackageUnavailable'} }
+    if (-not $EnvironmentValues) {
+        $userSelection = Get-CodexPersistedEnvironmentValue -Source User
+        $machineSelection = Get-CodexPersistedEnvironmentValue -Source Machine
+        $EnvironmentValues = [ordered]@{
+            User=$userSelection.Value;UserRawValue=$userSelection.RawValue;UserKind=$userSelection.RegistryKind
+            Machine=$machineSelection.Value;MachineRawValue=$machineSelection.RawValue;MachineKind=$machineSelection.RegistryKind
+        }
+    }
+    $plan = Get-CoreSelectionRollbackPlan -Attempt $Attempt -LastHealthyCore $State.lastHealthyCore -EnvironmentValues $EnvironmentValues
+    if (-not $plan.CanRollback) { return [ordered]@{Attempted=$false;Successful=$false;Reason=$plan.Reason} }
+
+    $attemptRollbackKey = '{0}|{1}' -f [string]$Attempt.target.path,[string]$Attempt.target.sha256
+    if (($Attempt.Contains('rollbackKey') -and [string]$Attempt.rollbackKey -ceq $attemptRollbackKey) -or [string]$Attempt.status -eq 'RollbackAttempted') {
+        return [ordered]@{Attempted=$false;Successful=$false;Reason='RollbackAlreadyAttempted'}
+    }
+    $Attempt.rollbackKey = $attemptRollbackKey
+    $Attempt.status = 'RollbackAttempted'
+    $Attempt.rollbackReason = $plan.Reason
+    Save-WatchdogState -Config $Config -State $State
+
+    try {
+        $currentProcess = Get-CodexProcessObservation -Package $CurrentPackage -TrustedPreviousCore $State.lastHealthyCore
+        if ($currentProcess.AppServerStatus -eq 'Unknown') { return [ordered]@{Attempted=$true;Successful=$false;Reason='UnknownAppServerPreventsRollback'} }
+        if ($currentProcess.AllPackageProcessIds.Count -gt 0) {
+            Stop-CodexPackageProcesses -Package $CurrentPackage -Config $Config -TrustedPreviousCore $State.lastHealthyCore
+        }
+        Set-PersistedUserCodexSelection -Value $plan.UserValue -RegistryKind $plan.RegistryKind
+        $rollbackPackage = Get-CodexPackageInfo -Config $Config
+        $expected = Get-CodexDesiredCoreIdentity -Package $rollbackPackage
+        $previous = $State.lastHealthyCore.core
+        if ([string]$expected.Path -ine [string]$previous.path -or
+            ([string]$previous.kind -eq 'Managed' -and ([string]$expected.Sha256).ToUpperInvariant() -cne ([string]$previous.sha256).ToUpperInvariant())) {
+            return [ordered]@{Attempted=$true;Successful=$false;Reason='RollbackSelectionDidNotResolveToPreviousCore'}
+        }
+        $launchPlan = Get-CodexDesktopLaunchPlan -Package $rollbackPackage -UserHome $Config.UserHome
+        if ($launchPlan.Mode -ne 'Enhanced') { return [ordered]@{Attempted=$true;Successful=$false;Reason='EnhancedLauncherUnavailable'} }
+        $null = Start-CodexDesktop -Package $rollbackPackage -UserHome $Config.UserHome -LaunchPlan $launchPlan
+        $wait = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $rollbackPackage -TimeoutSeconds $TimeoutSeconds -ExpectedCore $expected
+        if (-not $wait.Ready) { return [ordered]@{Attempted=$true;Successful=$false;Reason='RollbackReadinessFailed'} }
+        $paths = Get-CodexDatabasePaths -Config $Config
+        $integrity = Test-CodexDatabaseIntegrity -DatabasePaths $paths
+        $enrollment = Get-RemoteEnrollmentObservation -DatabasePaths $paths
+        $rollbackObservation = [ordered]@{
+            Package=$wait.Package;Process=$wait.Process;Integrity=$integrity;Enrollment=$enrollment
+            Remote=[ordered]@{ManualCondition=$false}
+        }
+        if (Set-LastHealthyCoreFromObservation -State $State -Observation $rollbackObservation -Now ([DateTimeOffset]::UtcNow)) {
+            return [ordered]@{Attempted=$true;Successful=$true;Reason='RestoredLastHealthyCore'}
+        }
+        return [ordered]@{Attempted=$true;Successful=$false;Reason='RollbackHealthStateNotVerified'}
+    } catch {
+        return [ordered]@{Attempted=$true;Successful=$false;Reason='RollbackFailed'}
+    }
 }
 
 function Invoke-CodexRecovery {
@@ -1450,27 +2244,80 @@ function Invoke-CodexRecovery {
     )
 
     Write-DiagnosticSnapshot -Config $Config -Observation $Observation -Decision $Decision
-    if ($Automatic) {
-        $State.automaticRecoveryHistoryUtc = @($State.automaticRecoveryHistoryUtc) + $Now.ToString('o')
+    if ($Automatic) { $State.automaticRecoveryHistoryUtc = @($State.automaticRecoveryHistoryUtc) + $Now.ToString('o') }
+
+    $coreSwitch = $Decision.Reason -eq 'CoreSelectionChanged'
+    $expectedCore = Get-CodexDesiredCoreIdentity -Package $Observation.Package
+    $launch = $null
+    $waitResult = $null
+    $rollback = $null
+    $launchStarted = $false
+    $stopCompleted = $false
+    $failureReason = $null
+    $attempt = $null
+    $freshPackage = $null
+    if ($coreSwitch) {
+        $attempt = [ordered]@{
+            status='Attempting';createdAtUtc=$Now.ToString('o')
+            target=[ordered]@{source=[string]$expectedCore.Source;path=[string]$expectedCore.Path;rawValue=[string]$expectedCore.RawValue;sha256=[string]$expectedCore.Sha256;version=[string]$expectedCore.Version}
+        }
+        $State.coreSwitchAttempt = $attempt
+        Save-WatchdogState -Config $Config -State $State
     }
 
     Write-WatchdogEvent -Config $Config -Event $Mode -Reason $Decision.Reason -Outcome 'started' `
         -ThreadIds $Decision.ThreadIds -ProcessIds $Observation.Process.AllPackageProcessIds -PackageVersion $Observation.Package.Version -Validation $Decision.Validation
 
-    if ($Mode -eq 'Restart') {
-        Stop-CodexPackageProcesses -Package $Observation.Package -Config $Config
+    try {
+        if ($coreSwitch) {
+            $freshPackage = Get-CodexPackageInfo -Config $Config
+            $freshCore = Get-CodexDesiredCoreIdentity -Package $freshPackage
+            if (-not (Test-CodexCoreSelectionMatches -Actual $freshCore -Expected $expectedCore)) {
+                throw 'The persisted core selection changed before recovery began.'
+            }
+            $launchPlan = Get-CodexDesktopLaunchPlan -Package $freshPackage -UserHome $Config.UserHome
+            if ($launchPlan.Mode -ne 'Enhanced') { throw 'The canonical Enhanced launcher is unavailable for a core switch.' }
+        } else {
+            $freshPackage = $Observation.Package
+            $launchPlan = Get-CodexDesktopLaunchPlan -Package $freshPackage -UserHome $Config.UserHome
+        }
+        if ($Mode -eq 'Restart') {
+            Stop-CodexPackageProcesses -Package $freshPackage -Config $Config -TrustedPreviousCore $State.lastHealthyCore -ExpectedCore $expectedCore
+            $stopCompleted = $true
+        }
+        $launch = Start-CodexDesktop -Package $freshPackage -UserHome $Config.UserHome -LaunchPlan $launchPlan
+        $launchStarted = $true
+        $State.startupGraceUntilUtc = $Now.AddMinutes($Config.StartupGraceMinutes).ToString('o')
+        $waitResult = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $freshPackage -TimeoutSeconds $Config.RecoveryVerificationSeconds -ExpectedCore $expectedCore -TrustedPreviousCore $State.lastHealthyCore
+    } catch {
+        $failureReason = if ($coreSwitch -and $_.Exception.Message -match 'unrecognized|unknown|identity|selection changed') { 'SafeRecoveryGate' } else { 'RecoveryOperationFailed' }
     }
-    $launch = Start-CodexDesktop -Package $Observation.Package -UserHome $Config.UserHome
-    $State.startupGraceUntilUtc = $Now.AddMinutes($Config.StartupGraceMinutes).ToString('o')
-    $waitResult = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $Observation.Package -TimeoutSeconds $Config.RecoveryVerificationSeconds
-    $verifiedPackage = $waitResult.Package
-    $process = $waitResult.Process
+
+    $rollbackPackageInput = if ($waitResult) { $waitResult.Package } elseif ($freshPackage) { $freshPackage } else { $null }
+    $rollbackIsSafe = $coreSwitch -and $stopCompleted -and $rollbackPackageInput -and
+        ((-not $waitResult) -or $waitResult.Process.AppServerStatus -ne 'Unknown')
+    if ($rollbackIsSafe -and ((-not $waitResult) -or -not $waitResult.Ready)) {
+        $rollback = Invoke-CoreSelectionRollback -Config $Config -State $State -Attempt $attempt -CurrentPackage $rollbackPackageInput -TimeoutSeconds $Config.RecoveryVerificationSeconds
+    }
+
+    $verifiedPackage = if ($waitResult) { $waitResult.Package } else { Get-CodexPackageInfo -Config $Config }
+    if ($waitResult) {
+        $process = $waitResult.Process
+    } else {
+        $process = Get-CodexProcessObservation -Package $verifiedPackage -TrustedPreviousCore $State.lastHealthyCore
+    }
     $databasePaths = Get-CodexDatabasePaths -Config $Config
     $integrity = Test-CodexDatabaseIntegrity -DatabasePaths $databasePaths
     $enrollment = Get-RemoteEnrollmentObservation -DatabasePaths $databasePaths
-    $recoveryValidation = Get-RecoveryValidationReport -BeforePackage $Observation.Package -AfterPackage $verifiedPackage -Process $process -Integrity $integrity -Enrollment $enrollment
+    $recoveryValidation = Get-RecoveryValidationReport -BeforePackage $Observation.Package -AfterPackage $verifiedPackage -Process $process -Integrity $integrity -Enrollment $enrollment -ExpectedCore $expectedCore
+    if ($waitResult -and -not $waitResult.Ready) {
+        $recoveryValidation.checks += New-ValidationCheck -Name 'SelectedCoreReadiness' -Status 'failed' -Expected 'Desktop and app server ready on the selected core' -Observed $process.AppServerStatus
+    }
+    if ($failureReason) {
+        $recoveryValidation.checks += New-ValidationCheck -Name 'RecoveryOperation' -Status 'failed' -Expected 'Recovery completed safely' -Observed $failureReason
+    }
     $failedValidations = @($recoveryValidation.checks | Where-Object status -eq 'failed')
-    $successful = $failedValidations.Count -eq 0
+    $successful = $failedValidations.Count -eq 0 -and $waitResult -and $waitResult.Ready
 
     if ($successful) {
         $State.startupGraceUntilUtc = $null
@@ -1478,27 +2325,26 @@ function Invoke-CodexRecovery {
         $State.appServerMissingSinceUtc = $null
         $State.appServerMissingChecks = 0
         $State.staleCandidates = @()
+        $healthyObservation = [ordered]@{Package=$verifiedPackage;Process=$process;Integrity=$integrity;Enrollment=$enrollment;Remote=$Observation.Remote}
+        $null = Set-LastHealthyCoreFromObservation -State $State -Observation $healthyObservation -Now ([DateTimeOffset]::UtcNow)
         $outcome = 'succeeded'
     } else {
         $State.failedRecoveryUntilUtc = $Now.AddMinutes($Config.FailedRecoveryCooldownMinutes).ToString('o')
-        $outcome = 'failed'
+        if ($coreSwitch -and $State.coreSwitchAttempt) {
+            if (-not $rollback -or -not $rollback.Attempted) { $State.coreSwitchAttempt.status = 'Failed' }
+            $State.coreSwitchAttempt.failure = if ($failureReason) { $failureReason } else { 'DesiredCoreReadinessFailed' }
+        }
+        $outcome = if ($rollback -and $rollback.Successful) { 'failed-rolled-back' } else { 'failed' }
     }
 
     Write-WatchdogEvent -Config $Config -Event $Mode -Reason $Decision.Reason -Outcome $outcome `
         -ThreadIds $Decision.ThreadIds -ProcessIds $process.AllPackageProcessIds -PackageVersion $verifiedPackage.Version -Validation $recoveryValidation
     return [ordered]@{
-        Attempted        = $true
-        LaunchMethod     = $launch.Mode
-        Successful       = $successful
-        Outcome          = $outcome
-        PackageVersionBefore = $Observation.Package.Version
-        PackageVersionAfter = $verifiedPackage.Version
-        DesktopPresent   = $process.DesktopPresent
-        AppServerPresent = $process.AppServerPresent
-        IntegrityHealthy = $integrity.Healthy
-        EnrollmentStatus = $enrollment.Status
-        FailedValidations = @($failedValidations | ForEach-Object name)
-        Validation       = $recoveryValidation
+        Attempted=$true;LaunchMethod=if ($launch) { $launch.Mode } else { '' };Successful=[bool]$successful;Outcome=$outcome
+        PackageVersionBefore=$Observation.Package.Version;PackageVersionAfter=$verifiedPackage.Version
+        DesktopPresent=$process.DesktopPresent;AppServerPresent=$process.AppServerPresent
+        IntegrityHealthy=$integrity.Healthy;EnrollmentStatus=$enrollment.Status
+        FailedValidations=@($failedValidations | ForEach-Object name);Validation=$recoveryValidation;Rollback=$rollback
     }
 }
 
@@ -1522,57 +2368,105 @@ function Exit-WatchdogMutex {
     $Lock.Mutex.Dispose()
 }
 
-function Install-WatchdogScheduledTask {
+function Get-WatchdogStableCopyPlan {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
+    $root = [IO.Path]::GetFullPath([string]$Config.InstallRoot)
+    return [ordered]@{
+        Root=$root
+        ScriptPath=(Join-Path $root 'CodexWatchdog.ps1')
+        LauncherPath=(Join-Path $root 'CodexWatchdogLauncher.vbs')
+    }
+}
+
+function Install-WatchdogStableScripts {
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
 
-    $pwsh = Get-Command pwsh.exe -ErrorAction Stop
-    if (-not (Get-Command sqlite3 -ErrorAction SilentlyContinue)) {
-        throw 'sqlite3 must be installed on PATH before the watchdog can be scheduled.'
+    $plan = Get-WatchdogStableCopyPlan -Config $Config
+    $sourceScript = [string]$Config.SourceScriptPath
+    $sourceLauncher = [string]$Config.SourceLauncherPath
+    foreach ($source in @($sourceScript,$sourceLauncher)) {
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or (Test-CodexPathHasReparsePoint -Path $source)) {
+            throw 'A Watchdog install source is missing or contains a reparse point.'
+        }
     }
-    if (-not (Test-Path -LiteralPath $Config.ScriptPath -PathType Leaf)) {
-        throw "Watchdog script not found at $($Config.ScriptPath)."
+    if (Test-CodexPathHasReparsePoint -Path $plan.Root) { throw 'The stable Watchdog install path contains a reparse point.' }
+    if (Test-Path -LiteralPath $plan.Root) {
+        $rootItem = Get-Item -LiteralPath $plan.Root -Force
+        if (-not $rootItem.PSIsContainer -or (Test-CodexPathHasReparsePoint -Path $plan.Root)) {
+            throw 'The stable Watchdog install directory must be an ordinary directory.'
+        }
+    } else {
+        $null = New-Item -ItemType Directory -Path $plan.Root -Force
     }
-    if (-not (Test-Path -LiteralPath $Config.LauncherPath -PathType Leaf)) {
-        throw "Hidden watchdog launcher not found at $($Config.LauncherPath)."
-    }
-    $wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
-    if (-not (Test-Path -LiteralPath $wscriptPath -PathType Leaf)) {
-        throw "Windows Script Host not found at $wscriptPath."
-    }
+    if (Test-CodexPathHasReparsePoint -Path $plan.Root) { throw 'The stable Watchdog install path contains a reparse point.' }
 
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $sid = $identity.User.Value
-    $taskService = New-Object -ComObject 'Schedule.Service'
-    $taskService.Connect()
-    try {
-        [void]$taskService.GetFolder($Config.TaskPath.TrimEnd('\'))
-    } catch {
-        [void]$taskService.GetFolder('\').CreateFolder($Config.TaskPath.Trim('\'))
+    foreach ($pair in @(
+        [pscustomobject]@{Source=$sourceScript;Destination=$plan.ScriptPath},
+        [pscustomobject]@{Source=$sourceLauncher;Destination=$plan.LauncherPath}
+    )) {
+        $samePath = [IO.Path]::GetFullPath($pair.Source) -ieq [IO.Path]::GetFullPath($pair.Destination)
+        if ($samePath) { continue }
+        if (Test-Path -LiteralPath $pair.Destination) {
+            $destinationItem = Get-Item -LiteralPath $pair.Destination -Force
+            if ($destinationItem.PSIsContainer -or (Test-CodexPathHasReparsePoint -Path $pair.Destination)) {
+                throw 'A stable Watchdog install file path must be an ordinary file.'
+            }
+        }
+        $sourceHash = (Get-FileHash -LiteralPath $pair.Source -Algorithm SHA256 -ErrorAction Stop).Hash
+        $destinationHash = if (Test-Path -LiteralPath $pair.Destination -PathType Leaf) {
+            (Get-FileHash -LiteralPath $pair.Destination -Algorithm SHA256 -ErrorAction Stop).Hash
+        } else { '' }
+        if ($sourceHash -ceq $destinationHash) { continue }
+        $temporary = Join-Path $plan.Root ('.{0}.{1}.tmp' -f [IO.Path]::GetFileName($pair.Destination),[Guid]::NewGuid().ToString('N'))
+        try {
+            [IO.File]::Copy($pair.Source,$temporary,$false)
+            Move-Item -LiteralPath $temporary -Destination $pair.Destination -Force
+        } finally {
+            if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+        }
+        if ((Get-FileHash -LiteralPath $pair.Destination -Algorithm SHA256 -ErrorAction Stop).Hash -cne $sourceHash) {
+            throw 'A stable Watchdog install copy failed content verification.'
+        }
     }
+    if ((Test-CodexPathHasReparsePoint -Path $plan.ScriptPath) -or (Test-CodexPathHasReparsePoint -Path $plan.LauncherPath)) {
+        throw 'The stable Watchdog install files cannot contain reparse points.'
+    }
+    $Config.ScriptPath = $plan.ScriptPath
+    $Config.LauncherPath = $plan.LauncherPath
+    return $plan
+}
 
+function New-WatchdogScheduledTaskXml {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][string]$PowerShellPath,
+        [Parameter(Mandatory)][string]$WScriptPath,
+        [Parameter(Mandatory)][string]$Sid,
+        [Parameter(Mandatory)][string]$Author
+    )
     $escape = [Security.SecurityElement]
-    $command = $escape::Escape($wscriptPath)
+    $command = $escape::Escape($WScriptPath)
     $launcherPath = $escape::Escape($Config.LauncherPath)
-    $pwshPath = $escape::Escape($pwsh.Source)
+    $pwshPath = $escape::Escape($PowerShellPath)
     $scriptPath = $escape::Escape($Config.ScriptPath)
     $workingDirectory = $escape::Escape((Split-Path -Parent $Config.ScriptPath))
-    $author = $escape::Escape($identity.Name)
+    $authorXml = $escape::Escape($Author)
     $arguments = "//B //NoLogo &quot;$launcherPath&quot; &quot;$pwshPath&quot; &quot;$scriptPath&quot;"
     $date = [DateTimeOffset]::Now.ToString('s')
     $firstScheduledCheck = [DateTimeOffset]::Now.AddMinutes(1).ToString('s')
-    $xml = @"
+    return @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Date>$date</Date>
-    <Author>$author</Author>
+    <Author>$authorXml</Author>
     <Description>Conservative local recovery watchdog for Codex Desktop and Mobile Remote.</Description>
     <URI>$($Config.TaskPath)$($Config.TaskName)</URI>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
-      <UserId>$sid</UserId>
+      <UserId>$Sid</UserId>
     </LogonTrigger>
     <TimeTrigger>
       <StartBoundary>$firstScheduledCheck</StartBoundary>
@@ -1585,7 +2479,7 @@ function Install-WatchdogScheduledTask {
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <UserId>$sid</UserId>
+      <UserId>$Sid</UserId>
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
@@ -1620,6 +2514,32 @@ function Install-WatchdogScheduledTask {
   </Actions>
 </Task>
 "@
+}
+
+function Install-WatchdogScheduledTask {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
+
+    $pwsh = Get-Command pwsh.exe -ErrorAction Stop | Select-Object -First 1
+    if (-not (Get-Command sqlite3 -ErrorAction SilentlyContinue)) {
+        throw 'sqlite3 must be installed on PATH before the watchdog can be scheduled.'
+    }
+    $null = Install-WatchdogStableScripts -Config $Config
+    $wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    if (-not (Test-Path -LiteralPath $wscriptPath -PathType Leaf)) {
+        throw "Windows Script Host not found at $wscriptPath."
+    }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $sid = $identity.User.Value
+    $taskService = New-Object -ComObject 'Schedule.Service'
+    $taskService.Connect()
+    try {
+        [void]$taskService.GetFolder($Config.TaskPath.TrimEnd('\'))
+    } catch {
+        [void]$taskService.GetFolder('\').CreateFolder($Config.TaskPath.Trim('\'))
+    }
+
+    $xml = New-WatchdogScheduledTaskXml -Config $Config -PowerShellPath $pwsh.Source -WScriptPath $wscriptPath -Sid $sid -Author $identity.Name
 
     Register-ScheduledTask -TaskName $Config.TaskName -TaskPath $Config.TaskPath -Xml $xml -Force | Out-Null
     return Get-ScheduledTask -TaskName $Config.TaskName -TaskPath $Config.TaskPath
@@ -1644,6 +2564,34 @@ function ConvertTo-PublicResult {
         [switch]$WhatIfMode
     )
 
+    $coreSelection=if ($Observation.Process.Contains('CoreSelection')) {
+        $Observation.Process.CoreSelection
+    } else {
+        [ordered]@{Kind='Unavailable';Source='None';Path='';Version='';Sha256='';HashVerified=$false}
+    }
+    $activeCoreProcesses=if ($Observation.Process.Contains('AppServerProcessIdentities')) {
+        @($Observation.Process.AppServerProcessIdentities)
+    } else { @() }
+    $selectedCorePresent=[bool](Get-JsonPropertyValue -Object $Observation.Process -Name 'SelectedCorePresent')
+    $trustedPreviousPresent=[bool](Get-JsonPropertyValue -Object $Observation.Process -Name 'TrustedPreviousCorePresent')
+    $coreSwitchPending=[bool](Get-JsonPropertyValue -Object $Observation.Process -Name 'CoreSwitchPending')
+    $observedServerStatus=[string](Get-JsonPropertyValue -Object $Observation.Process -Name 'AppServerStatus')
+    $coreReady=[bool]($selectedCorePresent -and $observedServerStatus -eq 'Recognized' -and -not $trustedPreviousPresent -and -not $coreSwitchPending)
+    $sourceOverride=if ($Observation.Package.Contains('AppServerOverride')) { $Observation.Package.AppServerOverride } else { $null }
+    $publicOverride=if ($sourceOverride) {
+        [ordered]@{
+            Executable=(Get-JsonPropertyValue -Object $sourceOverride -Name 'Executable')
+            Source=(Get-JsonPropertyValue -Object $sourceOverride -Name 'Source')
+            Error=(Get-JsonPropertyValue -Object $sourceOverride -Name 'Error')
+            Managed=(Get-JsonPropertyValue -Object $sourceOverride -Name 'Managed')
+            MetadataValidated=(Get-JsonPropertyValue -Object $sourceOverride -Name 'MetadataValidated')
+            HashVerified=(Get-JsonPropertyValue -Object $sourceOverride -Name 'HashVerified')
+            Sha256=(Get-JsonPropertyValue -Object $sourceOverride -Name 'Sha256')
+            Version=(Get-JsonPropertyValue -Object $sourceOverride -Name 'Version')
+            MetadataPath=(Get-JsonPropertyValue -Object $sourceOverride -Name 'MetadataPath')
+        }
+    } else { $null }
+
     return [ordered]@{
         timestampUtc          = $Observation.TimestampUtc
         action                = if ($WhatIfMode -and $Decision.Action -in @('Launch', 'Restart')) { "Would$($Decision.Action)" } else { $Decision.Action }
@@ -1654,9 +2602,24 @@ function ConvertTo-PublicResult {
         appServerStatus       = if ($Observation.Process.Contains('AppServerStatus')) { $Observation.Process.AppServerStatus } elseif ($Observation.Process.AppServerPresent) { 'Recognized' } else { 'Missing' }
         unknownAppServerProcessIds = @(if ($Observation.Process.Contains('UnknownAppServerProcessIds')) { $Observation.Process.UnknownAppServerProcessIds })
         unknownAppServerExecutables = @(if ($Observation.Process.Contains('UnknownAppServerExecutables')) { $Observation.Process.UnknownAppServerExecutables })
-        appServerOverride     = if ($Observation.Package.Contains('AppServerOverride')) { $Observation.Package.AppServerOverride } else { $null }
+        appServerOverride     = $publicOverride
         rootProcessIds        = @($Observation.Process.RootProcessIds)
         appServerProcessIds   = @($Observation.Process.AppServerProcessIds)
+        core = [ordered]@{
+            selection=[ordered]@{
+                kind=[string]$coreSelection.Kind;source=[string]$coreSelection.Source;path=[string]$coreSelection.Path
+                version=[string]$coreSelection.Version;sha256=[string]$coreSelection.Sha256;hashVerified=[bool]$coreSelection.HashVerified
+            }
+            ready=$coreReady
+            selectedPresent=$selectedCorePresent
+            pending=$coreSwitchPending
+            active=@($activeCoreProcesses | ForEach-Object {
+                [ordered]@{
+                    processId=[int]$_.processId;startedUtc=[string]$_.startedUtc;classification=[string]$_.classification
+                    coreVersion=[string]$_.coreVersion;coreSha256=[string]$_.coreSha256;executablePath=[string]$_.executablePath
+                }
+            })
+        }
         databaseIntegrity     = $Observation.Integrity
         enrollmentStatus      = $Observation.Enrollment.Status
         remoteFailureCount    = $Observation.Remote.FailureCount
@@ -1699,7 +2662,8 @@ function Invoke-CodexWatchdogMain {
     $config = Get-WatchdogConfig
     if ($RequestedAction -eq 'Install') {
         if ($WhatIfMode) {
-            Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{ action = 'WouldInstall'; task = "$($config.TaskPath)$($config.TaskName)"; script = $config.ScriptPath })
+            $stablePlan = Get-WatchdogStableCopyPlan -Config $config
+            Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{ action = 'WouldInstall'; task = "$($config.TaskPath)$($config.TaskName)"; script = $stablePlan.ScriptPath; launcher = $stablePlan.LauncherPath })
             return
         }
         $task = Install-WatchdogScheduledTask -Config $config
@@ -1747,6 +2711,9 @@ function Invoke-CodexWatchdogMain {
         $persistedState = Read-WatchdogState -Config $config
         $workingState = if ($RequestedAction -eq 'Status' -or $WhatIfMode) { Copy-WatchdogState $persistedState } else { $persistedState }
         $observation = Get-CodexObservation -Config $config -State $workingState -Now $now
+        if (-not $WhatIfMode -and $RequestedAction -eq 'Check') {
+            $null = Set-LastHealthyCoreFromObservation -State $workingState -Observation $observation -Now $now
+        }
         if ($RequestedAction -eq 'Restart') {
             $decision = New-WatchdogDecision -Action 'Restart' -Reason 'ManualRestartRequested'
         } else {
