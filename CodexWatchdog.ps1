@@ -2398,6 +2398,23 @@ function Get-CodexDesktopHandshakeObservation {
     $roots=@($RootProcessIdentities | Where-Object {
         [int](Get-JsonPropertyValue -Object $_ -Name 'processId') -gt 0
     })
+    $rootIdentityChecks=[System.Collections.Generic.List[object]]::new()
+    $evidence=[ordered]@{
+        RootProcessCount=@($RootProcessIdentities).Count
+        InvalidRootCount=@($RootProcessIdentities).Count-$roots.Count
+        RootIdentityChecks=$rootIdentityChecks
+        SearchedDirectoryCount=0;ExistingDirectoryCount=0;DirectoryReadErrorCount=0;MatchingFileCount=0
+    }
+    foreach($invalidRoot in @($RootProcessIdentities | Where-Object {
+        [int](Get-JsonPropertyValue -Object $_ -Name 'processId') -le 0
+    } | Select-Object -First 8)){
+        $rootIdentityChecks.Add([ordered]@{
+            ProcessId=[int](Get-JsonPropertyValue -Object $invalidRoot -Name 'processId')
+            StartedUtc=$null;ExecutableNameMatches=$false;Status='ProcessIdInvalid'
+        })
+    }
+    $searchedDirectoryPaths=[System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $existingDirectoryPaths=[System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $requiredIds=@($RequiredProcessIds | ForEach-Object {[int]$_} | Where-Object {$_ -gt 0} | Select-Object -Unique)
     $checkedAtUtc=[DateTimeOffset]::UtcNow.ToString('o')
 
@@ -2405,18 +2422,21 @@ function Get-CodexDesktopHandshakeObservation {
         return [ordered]@{
             Verified=$false;Status='LogsRootUnavailable';VerifiedProcessIds=@();RequiredProcessIds=$requiredIds
             AllRequiredProcessesVerified=$false;ExaminedFileCount=0;ReadErrorCount=0;CheckedAtUtc=$checkedAtUtc
+            Evidence=$evidence
         }
     }
     if($roots.Count -eq 0){
         return [ordered]@{
             Verified=$false;Status='NoDesktopRoots';VerifiedProcessIds=@();RequiredProcessIds=$requiredIds
             AllRequiredProcessesVerified=$false;ExaminedFileCount=0;ReadErrorCount=0;CheckedAtUtc=$checkedAtUtc
+            Evidence=$evidence
         }
     }
     if($roots.Count -gt 8){
         return [ordered]@{
             Verified=$false;Status='TooManyDesktopRoots';VerifiedProcessIds=@();RequiredProcessIds=$requiredIds
             AllRequiredProcessesVerified=$false;ExaminedFileCount=0;ReadErrorCount=0;CheckedAtUtc=$checkedAtUtc
+            Evidence=$evidence
         }
     }
 
@@ -2432,8 +2452,18 @@ function Get-CodexDesktopHandshakeObservation {
         $processId=[int](Get-JsonPropertyValue -Object $rootIdentity -Name 'processId')
         $startedValue=Get-JsonPropertyValue -Object $rootIdentity -Name 'startedUtc'
         $executablePath=[string](Get-JsonPropertyValue -Object $rootIdentity -Name 'executablePath')
-        if(-not $startedValue -or [IO.Path]::GetFileName($executablePath) -ine 'ChatGPT.exe'){continue}
-        try{$rootStartedUtc=ConvertTo-UtcDateTimeOffset $startedValue}catch{continue}
+        $rootCheck=[ordered]@{
+            ProcessId=$processId;StartedUtc=$null
+            ExecutableNameMatches=([IO.Path]::GetFileName($executablePath) -ieq 'ChatGPT.exe')
+            Status='ReadyForLogSearch'
+        }
+        $rootIdentityChecks.Add($rootCheck)
+        if(-not $startedValue){$rootCheck.Status='StartTimeMissing';$evidence.InvalidRootCount++;continue}
+        if(-not $rootCheck.ExecutableNameMatches){$rootCheck.Status='ExecutableNameMismatch';$evidence.InvalidRootCount++;continue}
+        try{
+            $rootStartedUtc=ConvertTo-UtcDateTimeOffset $startedValue
+            $rootCheck.StartedUtc=$rootStartedUtc.ToString('o')
+        }catch{$rootCheck.Status='StartTimeInvalid';$evidence.InvalidRootCount++;continue}
 
         $dateDirectories=[System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach($baseDate in @($rootStartedUtc.UtcDateTime.Date,$rootStartedUtc.ToLocalTime().Date)){
@@ -2447,15 +2477,20 @@ function Get-CodexDesktopHandshakeObservation {
         $pidFilePattern='(?i)^codex-desktop-.+-'+[Regex]::Escape([string]$processId)+'-t\d+-i\d+-\d+-\d+\.log$'
         $matchingFiles=[System.Collections.Generic.List[System.IO.FileInfo]]::new()
         foreach($dateDirectory in $dateDirectories){
+            $null=$searchedDirectoryPaths.Add($dateDirectory)
+            $evidence.SearchedDirectoryCount=$searchedDirectoryPaths.Count
             if(-not (Test-Path -LiteralPath $dateDirectory -PathType Container)){continue}
+            $null=$existingDirectoryPaths.Add($dateDirectory)
+            $evidence.ExistingDirectoryCount=$existingDirectoryPaths.Count
             try{
                 $dateFiles=@(Get-ChildItem -LiteralPath $dateDirectory -Filter 'codex-desktop-*.log' -File -Force -ErrorAction Stop |
                     Where-Object {$_.Name -match $pidFilePattern})
                 foreach($dateFile in $dateFiles){$matchingFiles.Add($dateFile)}
-            }catch{$readErrorCount++}
+            }catch{$readErrorCount++;$evidence.DirectoryReadErrorCount++}
         }
         $orderedFiles=@($matchingFiles | Sort-Object LastWriteTimeUtc,FullName)
         $matchingFileCount+=$orderedFiles.Count
+        $evidence.MatchingFileCount=$matchingFileCount
         if($orderedFiles.Count -gt ($filesPerEdge*2)){
             $candidateFiles=@(@($orderedFiles | Select-Object -First $filesPerEdge)+@($orderedFiles | Select-Object -Last $filesPerEdge) |
                 Sort-Object LastWriteTimeUtc,FullName | Select-Object -Unique -Property FullName)
@@ -2535,6 +2570,7 @@ function Get-CodexDesktopHandshakeObservation {
         ExaminedFileCount=$examinedFileCount
         ReadErrorCount=$readErrorCount
         CheckedAtUtc=$checkedAtUtc
+        Evidence=$evidence
     }
 }
 
@@ -2840,7 +2876,18 @@ function Invoke-CodexRecovery {
         $recoveryValidation.checks += New-ValidationCheck -Name 'DesktopInitializeHandshake' `
             -Status $(if($handshake.AllRequiredProcessesVerified){'passed'}else{'failed'}) `
             -Expected 'Current Desktop initialize_handshake_result success over stdio' `
-            -Observed ([ordered]@{status=$handshake.Status;verifiedProcessIds=$handshake.VerifiedProcessIds;requiredProcessIds=$handshake.RequiredProcessIds})
+            -Observed ([ordered]@{
+                status=$handshake.Status;verifiedProcessIds=$handshake.VerifiedProcessIds;requiredProcessIds=$handshake.RequiredProcessIds
+                examinedFileCount=[int](Get-JsonPropertyValue -Object $handshake -Name 'ExaminedFileCount')
+                readErrorCount=[int](Get-JsonPropertyValue -Object $handshake -Name 'ReadErrorCount')
+                evidence=(Get-JsonPropertyValue -Object $handshake -Name 'Evidence')
+            })
+    }
+    if($rollback){
+        $recoveryValidation['rollback']=[ordered]@{
+            attempted=[bool]$rollback.Attempted;successful=[bool]$rollback.Successful;reason=[string]$rollback.Reason
+            desktopHandshake=(Get-JsonPropertyValue -Object $rollback -Name 'DesktopHandshake')
+        }
     }
     if ($failureReason) {
         $recoveryValidation.checks += New-ValidationCheck -Name 'RecoveryOperation' -Status 'failed' -Expected 'Recovery completed safely' -Observed $failureReason

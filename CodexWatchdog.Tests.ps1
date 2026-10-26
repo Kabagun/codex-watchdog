@@ -1096,7 +1096,7 @@ Describe 'Desktop initialization handshake verification' {
         $head.AllRequiredProcessesVerified | Should Be $true
         $head.VerifiedProcessIds | Should Be @($script:handshakeProcessId)
         $head.Status | Should Be 'Verified'
-        ($head|ConvertTo-Json -Compress) | Should Not Match 'initialize_handshake_result|xxxx'
+        ($head|ConvertTo-Json -Depth 8 -Compress) | Should Not Match 'initialize_handshake_result|xxxx'
 
         [IO.File]::WriteAllText($path,('x'*700000)+[Environment]::NewLine+$script:handshakeEventLine+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
         $tail=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
@@ -1133,6 +1133,55 @@ Describe 'Desktop initialization handshake verification' {
         $embedded=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
             -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
         $embedded.AllRequiredProcessesVerified | Should Be $false
+    }
+
+    It 'distinguishes skipped identities from missing PID files without recording rejected values or paths' {
+        $roots=@(
+            [ordered]@{processId=0;startedUtc='private-rejected-time';executablePath='C:\private-rejected-path\ChatGPT.exe'}
+            [ordered]@{processId=74123;startedUtc='';executablePath=$script:handshakeRootPath}
+            [ordered]@{processId=74124;startedUtc='private-rejected-time';executablePath=$script:handshakeRootPath}
+            [ordered]@{processId=74125;startedUtc=$script:handshakeRootStart;executablePath='C:\private-rejected-path\other.exe'}
+        )
+        $result=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities $roots -RequiredProcessIds @(74123)
+        $result.Status | Should Be 'NoPidLogs'
+        $result.AllRequiredProcessesVerified | Should Be $false
+        $result.Evidence.RootProcessCount | Should Be 4
+        $result.Evidence.InvalidRootCount | Should Be 4
+        @($result.Evidence.RootIdentityChecks | ForEach-Object Status) | Should Be @(
+            'ProcessIdInvalid','StartTimeMissing','StartTimeInvalid','ExecutableNameMismatch'
+        )
+        $result.Evidence.SearchedDirectoryCount | Should Be 0
+        ($result|ConvertTo-Json -Depth 8 -Compress) | Should Not Match 'private-rejected|synthetic-app|other.exe|ChatGPT.exe'
+    }
+
+    It 'distinguishes absent date folders, unmatched PID filenames and directory enumeration errors' {
+        $absent=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $absent.Status | Should Be 'NoPidLogs'
+        ($absent.Evidence.SearchedDirectoryCount -gt 0) | Should Be $true
+        $absent.Evidence.ExistingDirectoryCount | Should Be 0
+        $absent.Evidence.InvalidRootCount | Should Be 0
+        $absent.Evidence.RootIdentityChecks[0].Status | Should Be 'ReadyForLogSearch'
+        $absent.Evidence.RootIdentityChecks[0].StartedUtc | Should Be $script:handshakeRootStart.ToString('o')
+        $absent.Evidence.RootIdentityChecks[0].ExecutableNameMatches | Should Be $true
+
+        $null=Write-TestDesktopHandshakeFile -LogsRoot $script:handshakeLogsRoot -FileProcessId ($script:handshakeProcessId+1) `
+            -Timestamp $script:handshakeTimestamp -Line $script:handshakeEventLine
+        $unmatched=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $unmatched.Evidence.ExistingDirectoryCount | Should Be 1
+        $unmatched.Evidence.MatchingFileCount | Should Be 0
+        $unmatched.Evidence.DirectoryReadErrorCount | Should Be 0
+
+        Mock Get-ChildItem { throw 'private-enumeration-error' }
+        $unreadable=Get-CodexDesktopHandshakeObservation -Config $script:handshakeLogsConfig `
+            -RootProcessIdentities @($script:handshakeRootIdentity) -RequiredProcessIds @($script:handshakeProcessId)
+        $unreadable.AllRequiredProcessesVerified | Should Be $false
+        $unreadable.Evidence.DirectoryReadErrorCount | Should Be 1
+        $unreadable.ReadErrorCount | Should Be 1
+        $unreadable.ExaminedFileCount | Should Be 0
+        ($unreadable|ConvertTo-Json -Depth 8 -Compress) | Should Not Match 'private-enumeration-error|desktop-log-fixture|ChatGPT.exe'
     }
 }
 
@@ -1952,29 +2001,28 @@ Describe 'Core-switch recovery handshake opt-in' {
         $config.DataRoot=Join-Path $TestDrive 'core-handshake-state'
         $config.StatePath=Join-Path $config.DataRoot 'state.json'
         $config.SnapshotRoot=Join-Path $config.DataRoot 'snapshots'
+        $config.EventLogPath=Join-Path $config.DataRoot 'watchdog.jsonl'
+        $config.DesktopLogsRoot=Join-Path $script:coreHandshakeRoot 'desktop-logs'
+        $null=New-Item -ItemType Directory -Path $config.DesktopLogsRoot -Force
+        $config.RecoveryVerificationSeconds=0
         $script:coreHandshakeConfig=$config
         $script:coreHandshakeState=$state
         $script:coreHandshakeNow=$now
     }
 
     It 'requires the real Wait readiness gate with a successful current Desktop handshake for a core switch' {
-        $script:coreHandshakeProof=[ordered]@{
-            Verified=$true;Status='Verified';VerifiedProcessIds=@(20);RequiredProcessIds=@(20)
-            AllRequiredProcessesVerified=$true;ExaminedFileCount=1;ReadErrorCount=0
-        }
+        $stamp=$script:coreHandshakeNow
+        $line='{0} info [AppServerConnection] initialize_handshake_result outcome=success transportKind=stdio' -f $stamp.ToString('o')
+        $null=Write-TestDesktopHandshakeFile -LogsRoot $script:coreHandshakeConfig.DesktopLogsRoot -FileProcessId 20 `
+            -Timestamp $stamp -Line $line
         Mock Write-DiagnosticSnapshot {}
-        Mock Write-WatchdogEvent {}
+        Mock Start-Sleep {}
         Mock Get-CodexPackageInfo { $script:coreHandshakePackage }
         Mock Get-CodexProcessObservation { $script:coreHandshakeSelectedProcess }
         Mock Get-CodexDesktopLaunchPlan { [ordered]@{Mode='Enhanced';CanLaunch=$true} }
         Mock Stop-CodexPackageProcesses {}
         Mock Start-CodexDesktop { [ordered]@{Mode='Enhanced'} }
-        Mock Wait-CodexHealthyProcesses {
-            [ordered]@{
-                Ready=$true;Package=$script:coreHandshakePackage;Process=$script:coreHandshakeSelectedProcess
-                DesktopHandshake=$script:coreHandshakeProof
-            }
-        } -ParameterFilter { $RequireDesktopHandshake }
+        Mock Invoke-CoreSelectionRollback { throw 'A verified handshake must not trigger rollback.' }
         Mock Get-CodexDatabasePaths { [ordered]@{State='state';Logs='logs'} }
         Mock Test-CodexDatabaseIntegrity { [ordered]@{Healthy=$true;State='ok';Logs='ok'} }
         Mock Get-RemoteEnrollmentObservation { [ordered]@{Status='Enabled';EnabledCount=1} }
@@ -1985,6 +2033,55 @@ Describe 'Core-switch recovery handshake opt-in' {
 
         $result.Successful | Should Be $true
         $result.Validation.checks | Where-Object name -eq 'DesktopInitializeHandshake' | Select-Object -ExpandProperty status | Should Be 'passed'
-        Assert-MockCalled Wait-CodexHealthyProcesses -Times 1 -Exactly -Scope It -ParameterFilter { $RequireDesktopHandshake }
+        Assert-MockCalled Invoke-CoreSelectionRollback -Times 0 -Exactly -Scope It
+        $check=$result.Validation.checks | Where-Object name -eq 'DesktopInitializeHandshake'
+        $check.observed.evidence.MatchingFileCount | Should Be 1
+        $check.observed.evidence.RootIdentityChecks[0].Status | Should Be 'ReadyForLogSearch'
+    }
+
+    It 'persists the failed readiness evidence and the rollback result in the recovery event' -TestCases @(
+        @{RollbackSuccessful=$false;RollbackReason='RollbackReadinessFailed';ExpectedOutcome='failed'}
+        @{RollbackSuccessful=$true;RollbackReason='RestoredLastHealthyCore';ExpectedOutcome='failed-rolled-back'}
+    ) {
+        param($RollbackSuccessful,$RollbackReason,$ExpectedOutcome)
+        $script:recoveryRollbackReceipt=[ordered]@{
+            Attempted=$true;Successful=$RollbackSuccessful;Reason=$RollbackReason
+            DesktopHandshake=[ordered]@{
+                Status=if($RollbackSuccessful){'Verified'}else{'NoPidLogs'}
+                AllRequiredProcessesVerified=$RollbackSuccessful;VerifiedProcessIds=@();RequiredProcessIds=@(30)
+                ExaminedFileCount=0;ReadErrorCount=0
+                Evidence=[ordered]@{RootProcessCount=1;InvalidRootCount=0;ExistingDirectoryCount=0;MatchingFileCount=0}
+            }
+        }
+        Mock Write-DiagnosticSnapshot {}
+        Mock Start-Sleep {}
+        Mock Get-CodexPackageInfo { $script:coreHandshakePackage }
+        Mock Get-CodexProcessObservation { $script:coreHandshakeSelectedProcess }
+        Mock Get-CodexDesktopLaunchPlan { [ordered]@{Mode='Enhanced';CanLaunch=$true} }
+        Mock Stop-CodexPackageProcesses {}
+        Mock Start-CodexDesktop { [ordered]@{Mode='Enhanced'} }
+        Mock Invoke-CoreSelectionRollback { $script:recoveryRollbackReceipt }
+        Mock Get-CodexDatabasePaths { [ordered]@{State='state';Logs='logs'} }
+        Mock Test-CodexDatabaseIntegrity { [ordered]@{Healthy=$true;State='ok';Logs='ok'} }
+        Mock Get-RemoteEnrollmentObservation { [ordered]@{Status='Enabled';EnabledCount=1} }
+
+        $result=Invoke-CodexRecovery -Mode Restart -Config $script:coreHandshakeConfig -State $script:coreHandshakeState `
+            -Observation $script:coreHandshakeObservation `
+            -Decision (New-WatchdogDecision -Action Restart -Reason 'CoreSelectionChanged') -Now $script:coreHandshakeNow
+        $result.Successful | Should Be $false
+        $result.Outcome | Should Be $ExpectedOutcome
+        $event=Get-Content -LiteralPath $script:coreHandshakeConfig.EventLogPath -Tail 1 | ConvertFrom-Json
+        $event.outcome | Should Be $ExpectedOutcome
+        $event.validation.rollback.attempted | Should Be $true
+        $event.validation.rollback.successful | Should Be $RollbackSuccessful
+        $event.validation.rollback.reason | Should Be $RollbackReason
+        $event.validation.rollback.desktopHandshake.Status | Should Be $script:recoveryRollbackReceipt.DesktopHandshake.Status
+        $event.validation.rollback.desktopHandshake.Evidence.MatchingFileCount | Should Be 0
+        $check=$event.validation.checks | Where-Object name -eq 'DesktopInitializeHandshake'
+        $check.status | Should Be 'failed'
+        $check.observed.status | Should Be 'NoPidLogs'
+        $check.observed.evidence.RootIdentityChecks[0].ProcessId | Should Be 20
+        $check.observed.evidence.ExistingDirectoryCount | Should Be 0
+        ($check.observed|ConvertTo-Json -Depth 8 -Compress) | Should Not Match 'desktop-logs|ChatGPT.exe|initialize_handshake_result'
     }
 }
