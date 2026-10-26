@@ -122,6 +122,21 @@ function New-LegacyUpgradeFixture {
     return [ordered]@{Old=$old;New=$new;ArchiveDirectory=$archiveDirectory;ArchiveManifest=$archiveManifest}
 }
 
+function New-RegistryKeyRecorder {
+    $script:registryKeyCalls=[ordered]@{Deleted=@();Set=@();Disposed=$false}
+    $key=[pscustomobject]@{Calls=$script:registryKeyCalls}
+    Add-Member -InputObject $key -MemberType ScriptMethod -Name DeleteValue -Value {
+        param($Name,$ThrowOnMissing)
+        $this.Calls.Deleted=@($this.Calls.Deleted)+[string]$Name
+    }
+    Add-Member -InputObject $key -MemberType ScriptMethod -Name SetValue -Value {
+        param($Name,$Value,$Kind)
+        $this.Calls.Set=@($this.Calls.Set)+@([ordered]@{Name=[string]$Name;Value=$Value;Kind=[string]$Kind})
+    }
+    Add-Member -InputObject $key -MemberType ScriptMethod -Name Dispose -Value { $this.Calls.Disposed=$true }
+    return $key
+}
+
 function New-ManagedCoreProcessFixture {
     param(
         [Parameter(Mandatory)][DateTimeOffset]$Now,
@@ -822,6 +837,25 @@ Describe 'Managed core switching and rollback gates' {
         $again=Invoke-CoreSelectionRollback -Config $config -State $state -Attempt $attempt -CurrentPackage $newPackage -TimeoutSeconds 1 -EnvironmentValues @{User=$new.Path;Machine=''}
         $again.Reason | Should Be 'RollbackAlreadyAttempted'
         $script:rollbackEnvironmentWrites | Should Be 1
+    }
+}
+
+Describe 'User selector registry writes' {
+    It 'deletes a null selector and preserves an intentionally empty string as a value' {
+        $deleteKey=New-RegistryKeyRecorder
+        Set-PersistedUserCodexSelection -Value $null -RegistryKey $deleteKey
+        @($deleteKey.Calls.Deleted) | Should Be @('CODEX_CLI_PATH')
+        @($deleteKey.Calls.Set).Count | Should Be 0
+        $deleteKey.Calls.Disposed | Should Be $false
+
+        $emptyKey=New-RegistryKeyRecorder
+        Set-PersistedUserCodexSelection -Value '' -RegistryKind 'ExpandString' -RegistryKey $emptyKey
+        @($emptyKey.Calls.Deleted).Count | Should Be 0
+        @($emptyKey.Calls.Set).Count | Should Be 1
+        $emptyKey.Calls.Set[0].Name | Should Be 'CODEX_CLI_PATH'
+        $emptyKey.Calls.Set[0].Value | Should Be ''
+        $emptyKey.Calls.Set[0].Kind | Should Be 'ExpandString'
+        $emptyKey.Calls.Disposed | Should Be $false
     }
 }
 

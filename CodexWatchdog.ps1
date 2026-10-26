@@ -2153,8 +2153,9 @@ function Get-CoreSelectionRollbackPlan {
 }
 
 function Set-PersistedUserCodexSelection {
-    param([AllowNull()][string]$Value,[string]$RegistryKind)
-    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    param($Value,[string]$RegistryKind,$RegistryKey)
+    $ownsKey=$null -eq $RegistryKey
+    $key=if ($ownsKey) { [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') } else { $RegistryKey }
     try {
         if ($null -eq $Value) {
             $key.DeleteValue('CODEX_CLI_PATH',$false)
@@ -2163,7 +2164,7 @@ function Set-PersistedUserCodexSelection {
             if ($RegistryKind -in @('String','ExpandString')) { $kind = [Enum]::Parse([Microsoft.Win32.RegistryValueKind],$RegistryKind) }
             $key.SetValue('CODEX_CLI_PATH',$Value,$kind)
         }
-    } finally { if ($key) { $key.Dispose() } }
+    } finally { if ($ownsKey -and $key) { $key.Dispose() } }
 }
 
 function Invoke-CoreSelectionRollback {
