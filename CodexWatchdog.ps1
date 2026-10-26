@@ -91,6 +91,18 @@ function ConvertTo-UtcString {
     return (ConvertTo-UtcDateTimeOffset $Value).ToString('o')
 }
 
+function Test-CodexUtcTimestampEqual {
+    param($Left,$Right)
+
+    if ($null -eq $Left -or $null -eq $Right -or
+        [string]::IsNullOrWhiteSpace([string]$Left) -or [string]::IsNullOrWhiteSpace([string]$Right)) { return $false }
+    try {
+        $leftUtc=ConvertTo-UtcDateTimeOffset -Value $Left
+        $rightUtc=ConvertTo-UtcDateTimeOffset -Value $Right
+        return [bool]($leftUtc.UtcDateTime.Ticks -eq $rightUtc.UtcDateTime.Ticks)
+    } catch { return $false }
+}
+
 function New-WatchdogState {
     return [ordered]@{
         schemaVersion               = 1
@@ -830,9 +842,9 @@ function Get-CodexProcessObservation {
             [string]$previousCoreRecord.path -and $process.ExecutablePath -ieq [string]$previousCoreRecord.path -and
             $previousProcessRecord.startUtc -and $processCreationDate -and $desktopIdentity -and
             [int]$previousProcessRecord.desktopPid -eq [int]$desktopIdentity.processId -and
-            [string]$previousProcessRecord.desktopStartUtc -ceq [string]$desktopIdentity.startedUtc) {
+            (Test-CodexUtcTimestampEqual -Left $previousProcessRecord.desktopStartUtc -Right $desktopIdentity.startedUtc)) {
             try {
-                $isTrustedPrevious = (ConvertTo-UtcString $processCreationDate) -ceq [string]$previousProcessRecord.startUtc
+                $isTrustedPrevious = Test-CodexUtcTimestampEqual -Left $processCreationDate -Right $previousProcessRecord.startUtc
                 if ($isTrustedPrevious -and [string]$previousCoreRecord.kind -eq 'Managed') {
                     if (-not [string]$previousCoreRecord.sha256 -or (Test-CodexPathHasReparsePoint -Path ([string]$process.ExecutablePath))) {
                         $isTrustedPrevious = $false

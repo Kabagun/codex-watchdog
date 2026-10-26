@@ -708,6 +708,64 @@ Describe 'Managed core switching and rollback gates' {
         $decision.Reason | Should Be 'CoreSelectionChanged'
     }
 
+    It 'recognizes a trusted previous core after saved and copied state round trips with subsecond offsets' {
+        $config.DataRoot=Join-Path $TestDrive 'timestamp-roundtrip-state'
+        $config.StatePath=Join-Path $config.DataRoot 'state.json'
+        $config.SnapshotRoot=Join-Path $config.DataRoot 'snapshots'
+        $desktopStart=[DateTimeOffset]::Parse('2026-10-26T12:00:00.1234567+03:00')
+        $serverStart=[DateTimeOffset]::Parse('2026-10-26T05:00:01.7654321-04:00')
+        $state.lastHealthyCore.process.startUtc=$serverStart.ToString('o')
+        $state.lastHealthyCore.process.desktopStartUtc=$desktopStart.ToString('o')
+        Save-WatchdogState -Config $config -State $state
+        $loaded=Read-WatchdogState -Config $config
+        $copied=Copy-WatchdogState -State $loaded
+        ($loaded.lastHealthyCore.process.startUtc -is [DateTime]) | Should Be $true
+        ($loaded.lastHealthyCore.process.desktopStartUtc -is [DateTime]) | Should Be $true
+
+        $desktop=[pscustomobject]@{
+            ProcessId=20;ParentProcessId=1;Name='ChatGPT.exe';ExecutablePath=$newPackage.DesktopExecutable
+            CommandLine='desktop';CreationDate=$desktopStart
+        }
+        $server=[pscustomobject]@{
+            ProcessId=21;ParentProcessId=20;Name='codex.exe';ExecutablePath=$old.Path
+            CommandLine='codex.exe app-server';CreationDate=$serverStart
+        }
+        foreach($snapshot in @($loaded,$copied)){
+            $process=Get-CodexProcessObservation -Package $newPackage -Processes @($desktop,$server) -TrustedPreviousCore $snapshot.lastHealthyCore
+            $process.TrustedPreviousCorePresent | Should Be $true
+            $process.AppServerStatus | Should Be 'Recognized'
+            $process.CoreSwitchPending | Should Be $true
+        }
+    }
+
+    It 'rejects reused server and Desktop PIDs when their normalized creation times differ' {
+        $desktopStart=[DateTimeOffset]::Parse('2026-10-26T12:00:00.1234567+03:00')
+        $serverStart=[DateTimeOffset]::Parse('2026-10-26T05:00:01.7654321-04:00')
+        $state.lastHealthyCore.process.startUtc=$serverStart.ToString('o')
+        $state.lastHealthyCore.process.desktopStartUtc=$desktopStart.ToString('o')
+        $desktop=[pscustomobject]@{
+            ProcessId=20;ParentProcessId=1;Name='ChatGPT.exe';ExecutablePath=$newPackage.DesktopExecutable
+            CommandLine='desktop';CreationDate=$desktopStart
+        }
+        $reusedServer=[pscustomobject]@{
+            ProcessId=21;ParentProcessId=20;Name='codex.exe';ExecutablePath=$old.Path
+            CommandLine='codex.exe app-server';CreationDate=$serverStart.AddTicks(1)
+        }
+        $serverMismatch=Get-CodexProcessObservation -Package $newPackage -Processes @($desktop,$reusedServer) -TrustedPreviousCore $state.lastHealthyCore
+        $serverMismatch.TrustedPreviousCorePresent | Should Be $false
+        $serverMismatch.AppServerStatus | Should Be 'Unknown'
+
+        $originalServer=[pscustomobject]@{
+            ProcessId=21;ParentProcessId=20;Name='codex.exe';ExecutablePath=$old.Path
+            CommandLine='codex.exe app-server';CreationDate=$serverStart
+        }
+        $reusedDesktopState=Copy-WatchdogState -State $state
+        $reusedDesktopState.lastHealthyCore.process.desktopStartUtc=$desktopStart.AddTicks(1).ToString('o')
+        $desktopMismatch=Get-CodexProcessObservation -Package $newPackage -Processes @($desktop,$originalServer) -TrustedPreviousCore $reusedDesktopState.lastHealthyCore
+        $desktopMismatch.TrustedPreviousCorePresent | Should Be $false
+        $desktopMismatch.AppServerStatus | Should Be 'Unknown'
+    }
+
     It 'switches when the old server is gone but the selected managed core is not running yet' {
         $missing=Get-CodexProcessObservation -Package $newPackage -Processes @($previous.Desktop) -TrustedPreviousCore $state.lastHealthyCore
         $missing.AppServerStatus | Should Be 'Missing'
