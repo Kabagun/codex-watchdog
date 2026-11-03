@@ -495,19 +495,25 @@ Describe 'Codex watchdog decision rules' {
         $decision.Reason | Should Be 'StartupGracePeriod'
     }
 
-    It 'restarts after the app server is missing for five minutes and three checks' {
+    It 'requires manual recovery after the app server is missing for five minutes and three checks' {
         $state.appServerMissingSinceUtc = $now.AddMinutes(-6).ToString('o')
         $state.appServerMissingChecks = 2
-        $decision = Get-WatchdogDecision -Observation (New-TestObservation -AppServerPresent $false) -State $state -Config $config -Now $now
-        $decision.Action | Should Be 'Restart'
+        $observation=New-TestObservation -AppServerPresent $false
+        $decision = Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+        $decision.Action | Should Be 'Manual'
         $decision.Reason | Should Be 'AppServerMissing'
+        $check=(Get-TriggerValidationReport -Decision $decision -Observation $observation -State $state -Config $config -Now $now).checks[0]
+        $check.missingMinutes | Should Be 6
+        $check.thresholdMinutes | Should Be 5
+        $check.consecutiveChecks | Should Be 3
     }
 
-    It 'restarts an unprotected pre-dispatch freeze' {
+    It 'reports an unprotected pre-dispatch freeze for manual recovery' {
         $thread = New-TestThread -ThreadId '00000000-0000-0000-0000-000000000001' -Status 'PreDispatchFreeze' -Now $now
         $decision = Get-WatchdogDecision -Observation (New-TestObservation -Threads @($thread)) -State $state -Config $config -Now $now
-        $decision.Action | Should Be 'Restart'
+        $decision.Action | Should Be 'Manual'
         $decision.Reason | Should Be 'PreDispatchLifecycleFreeze'
+        $decision.ThreadIds | Should Be @($thread.ThreadId)
     }
 
     It 'protects the shared app when another task is healthy' {
@@ -540,8 +546,9 @@ Describe 'Codex watchdog decision rules' {
             observedSinceUtc = $now.AddMinutes(-6).ToString('o')
         })
         $decision = Get-WatchdogDecision -Observation (New-TestObservation -Threads @($thread)) -State $state -Config $config -Now $now
-        $decision.Action | Should Be 'Restart'
+        $decision.Action | Should Be 'Manual'
         $decision.Reason | Should Be 'ConfirmedStaleTask'
+        $decision.ThreadIds | Should Be @($thread.ThreadId)
     }
 
     It 'does not confirm a stale task whose fingerprint changed' {
@@ -560,10 +567,24 @@ Describe 'Codex watchdog decision rules' {
         $decision.Action | Should Be 'None'
     }
 
-    It 'restarts after repeated Remote transport failures while idle' {
+    It 'reports repeated Remote transport failures for manual recovery while idle' {
         $decision = Get-WatchdogDecision -Observation (New-TestObservation -RemoteRepeatedFailure $true) -State $state -Config $config -Now $now
-        $decision.Action | Should Be 'Restart'
+        $decision.Action | Should Be 'Manual'
         $decision.Reason | Should Be 'RepeatedRemoteTransportFailure'
+    }
+
+    It 'keeps repeated Remote failure protection for <Status> activity' -TestCases @(
+        @{Status='Healthy'}
+        @{Status='Starting'}
+        @{Status='ToolRunning'}
+        @{Status='WaitingForInput'}
+    ) {
+        param($Status)
+        $thread=New-TestThread -ThreadId '00000000-0000-0000-0000-000000000006' -Status $Status -Now $now
+        $decision=Get-WatchdogDecision -Observation (New-TestObservation -RemoteRepeatedFailure $true -Threads @($thread)) -State $state -Config $config -Now $now
+        $decision.Action | Should Be 'None'
+        $decision.Reason | Should Be 'HealthyTaskProtectsSharedApp'
+        $decision.ProtectedByThreadIds | Should Be @($thread.ThreadId)
     }
 
     It 'does not restart for Remote authentication failures' {
@@ -602,6 +623,226 @@ Describe 'Codex watchdog decision rules' {
         $decision = Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
         $decision.Action | Should Be 'None'
         $decision.Reason | Should Be 'AutomaticRecoveryRateLimit'
+    }
+}
+
+Describe 'Automatic restart prohibition' {
+    BeforeEach {
+        $config=Get-WatchdogConfig
+        $state=New-WatchdogState
+        $now=[DateTimeOffset]::Parse('2026-11-03T09:00:00Z')
+        $config.DataRoot=Join-Path $TestDrive 'automatic-recovery'
+        $config.StatePath=Join-Path $config.DataRoot 'state.json'
+        $config.SnapshotRoot=Join-Path $config.DataRoot 'snapshots'
+        $config.EventLogPath=Join-Path $config.DataRoot 'watchdog.jsonl'
+    }
+
+    It 'rejects a fabricated automatic Restart for <Reason> before any side effects' -TestCases @(
+        @{Reason='CoreSelectionChanged';DesktopPresent=$true}
+        @{Reason='AppServerMissing';DesktopPresent=$true}
+        @{Reason='PreDispatchLifecycleFreeze';DesktopPresent=$true}
+        @{Reason='ConfirmedStaleTask';DesktopPresent=$true}
+        @{Reason='RepeatedRemoteTransportFailure';DesktopPresent=$true}
+        @{Reason='ManualRestartRequested';DesktopPresent=$true}
+        @{Reason='CodexDesktopAbsent';DesktopPresent=$false}
+    ) {
+        param($Reason,$DesktopPresent)
+        $state.automaticRecoveryHistoryUtc=@($now.AddMinutes(-20).ToString('o'))
+        $state.coreSwitchAttempt=[ordered]@{status='Failed';target=[ordered]@{path='synthetic-selected-core';sha256=('a'*64)}}
+        $before=$state | ConvertTo-Json -Depth 12 -Compress
+        $observation=New-TestObservation -DesktopPresent $DesktopPresent
+        Mock Write-DiagnosticSnapshot { throw 'Forbidden snapshot side effect.' }
+        Mock Save-WatchdogState { throw 'Forbidden state write.' }
+        Mock Write-WatchdogEvent { throw 'Forbidden event write.' }
+        Mock Get-CodexDesiredCoreIdentity { throw 'Core resolution must not be reached.' }
+        Mock Stop-CodexPackageProcesses { throw 'Forbidden process shutdown.' }
+        Mock Start-CodexDesktop { throw 'Forbidden app launch.' }
+        Mock Set-PersistedUserCodexSelection { throw 'Forbidden selector write.' }
+        Mock Invoke-CoreSelectionRollback { throw 'Forbidden core rollback.' }
+        Mock Wait-CodexHealthyProcesses { throw 'Readiness must not be reached.' }
+        $decision=New-WatchdogDecision -Action Restart -Reason $Reason
+        $failure=$null
+
+        try {
+            Invoke-CodexRecovery -Automatic -Mode Restart -Config $config -State $state `
+                -Observation $observation -Decision $decision -Now $now
+        } catch { $failure=$_ }
+
+        ($null -ne $failure) | Should Be $true
+        $failure.Exception.Message | Should Match '(?i)automatic.*restart|restart.*automatic'
+        ($state | ConvertTo-Json -Depth 12 -Compress) | Should Be $before
+        (Test-Path -LiteralPath $config.DataRoot) | Should Be $false
+        Assert-MockCalled Write-DiagnosticSnapshot -Times 0 -Exactly -Scope It
+        Assert-MockCalled Save-WatchdogState -Times 0 -Exactly -Scope It
+        Assert-MockCalled Write-WatchdogEvent -Times 0 -Exactly -Scope It
+        Assert-MockCalled Get-CodexDesiredCoreIdentity -Times 0 -Exactly -Scope It
+        Assert-MockCalled Stop-CodexPackageProcesses -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-CodexDesktop -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-PersistedUserCodexSelection -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-CoreSelectionRollback -Times 0 -Exactly -Scope It
+        Assert-MockCalled Wait-CodexHealthyProcesses -Times 0 -Exactly -Scope It
+    }
+
+}
+
+Describe 'Manual fault monitoring and explicit recovery routing' {
+    BeforeEach {
+        $config=Get-WatchdogConfig
+        $config.DataRoot=Join-Path $TestDrive 'manual-diagnostics'
+        $config.StatePath=Join-Path $config.DataRoot 'state.json'
+        $config.SnapshotRoot=Join-Path $config.DataRoot 'snapshots'
+        $config.EventLogPath=Join-Path $config.DataRoot 'watchdog.jsonl'
+    }
+
+    It 'continues monitoring and persists actionable Manual fault diagnostics without recovery' {
+        $script:manualFaultConfig=$config
+        $script:manualFaultObservation=New-TestObservation -RemoteRepeatedFailure $true
+        Mock Get-WatchdogConfig { $script:manualFaultConfig }
+        Mock Enter-WatchdogMutex { [ordered]@{Acquired=$true} }
+        Mock Exit-WatchdogMutex {}
+        Mock Read-WatchdogState { New-WatchdogState }
+        Mock Get-CodexObservation { $script:manualFaultObservation }
+        Mock Set-LastHealthyCoreFromObservation { $false }
+        Mock Invoke-CodexRecovery { throw 'A Manual diagnostic must never invoke recovery.' }
+        Mock ConvertTo-PublicResult { [ordered]@{action=$Decision.Action;reason=$Decision.Reason;validation=$Decision.Validation;recovery=$Recovery} }
+
+        $result=Invoke-CodexWatchdogMain -RequestedAction Check -AsJson | ConvertFrom-Json
+
+        $result.action | Should Be 'Manual'
+        $result.reason | Should Be 'RepeatedRemoteTransportFailure'
+        $result.recovery | Should Be $null
+        $event=Get-Content -LiteralPath $config.EventLogPath -Tail 1 | ConvertFrom-Json
+        $event.event | Should Be 'Check'
+        $event.outcome | Should Be 'Manual'
+        $event.validation.checks[0].name | Should Be 'RemoteTransportHealthy'
+        $event.validation.checks[0].failureCount | Should Be 4
+        $event.validation.checks[0].failureSpanMinutes | Should Be 6
+        $saved=Get-Content -LiteralPath $config.StatePath -Raw | ConvertFrom-Json
+        $saved.lastDecision | Should Be 'Manual'
+        @($saved.automaticRecoveryHistoryUtc).Count | Should Be 0
+        Assert-MockCalled Invoke-CodexRecovery -Times 0 -Exactly -Scope It
+    }
+
+    It 'retains an explicit Restart request without marking its recovery Automatic' {
+        $script:manualFaultConfig=$config
+        $script:manualFaultObservation=New-TestObservation
+        Mock Get-WatchdogConfig { $script:manualFaultConfig }
+        Mock Enter-WatchdogMutex { [ordered]@{Acquired=$true} }
+        Mock Exit-WatchdogMutex {}
+        Mock Read-WatchdogState { New-WatchdogState }
+        Mock Get-CodexObservation { $script:manualFaultObservation }
+        Mock Invoke-CodexRecovery { [ordered]@{Successful=$true;Outcome='succeeded'} }
+        Mock ConvertTo-PublicResult { [ordered]@{action=$Decision.Action;reason=$Decision.Reason;recovery=$Recovery} }
+
+        $result=Invoke-CodexWatchdogMain -RequestedAction Restart -AsJson | ConvertFrom-Json
+
+        $result.action | Should Be 'Restart'
+        $result.reason | Should Be 'ManualRestartRequested'
+        $result.recovery.Successful | Should Be $true
+        Assert-MockCalled Invoke-CodexRecovery -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Mode -eq 'Restart' -and -not $Automatic -and $Decision.Reason -eq 'ManualRestartRequested'
+        }
+    }
+
+    It 'reports a skipped automatic Launch as an existing Desktop rather than an attempted recovery' {
+        $script:manualFaultConfig=$config
+        $script:manualFaultObservation=New-TestObservation -DesktopPresent $false -AppServerPresent $false
+        Mock Get-WatchdogConfig { $script:manualFaultConfig }
+        Mock Enter-WatchdogMutex { [ordered]@{Acquired=$true} }
+        Mock Exit-WatchdogMutex {}
+        Mock Read-WatchdogState { New-WatchdogState }
+        Mock Get-CodexObservation { $script:manualFaultObservation }
+        Mock Invoke-CodexRecovery { [ordered]@{Attempted=$false;Successful=$false;Skipped=$true;Outcome='skipped';Reason='CodexAlreadyRunning';Validation=$null} }
+        Mock ConvertTo-PublicResult { [ordered]@{action=$Decision.Action;reason=$Decision.Reason;recovery=$Recovery} }
+
+        $result=Invoke-CodexWatchdogMain -RequestedAction Check -AsJson | ConvertFrom-Json
+
+        $result.action | Should Be 'None'
+        $result.reason | Should Be 'CodexAlreadyRunning'
+        $result.recovery.Attempted | Should Be $false
+        $event=Get-Content -LiteralPath $config.EventLogPath -Tail 1 | ConvertFrom-Json
+        $event.event | Should Be 'Check'
+        $event.outcome | Should Be 'None'
+        $event.reason | Should Be 'CodexAlreadyRunning'
+        Assert-MockCalled Invoke-CodexRecovery -Times 1 -Exactly -Scope It -ParameterFilter { $Mode -eq 'Launch' -and $Automatic }
+    }
+
+}
+
+Describe 'Automatic launch race protection' {
+    BeforeEach {
+        $config=Get-WatchdogConfig
+        $state=New-WatchdogState
+        $now=[DateTimeOffset]::Parse('2026-11-03T09:00:00Z')
+        $config.DataRoot=Join-Path $TestDrive 'automatic-launch'
+        $config.StatePath=Join-Path $config.DataRoot 'state.json'
+        $config.SnapshotRoot=Join-Path $config.DataRoot 'snapshots'
+        $config.EventLogPath=Join-Path $config.DataRoot 'watchdog.jsonl'
+    }
+
+    It 'skips automatic Launch before snapshots or budget writes when the Desktop has already appeared' {
+        $script:racePackage=[ordered]@{Found=$true;Version='fixture';DesktopExecutable='synthetic-desktop';AppServerExecutable='synthetic-core'}
+        $observation=New-TestObservation -DesktopPresent $false -AppServerPresent $false
+        $observation.Package=$script:racePackage
+        $before=$state | ConvertTo-Json -Depth 12 -Compress
+        Mock Get-CodexPackageInfo { $script:racePackage }
+        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$true;RootProcessIds=@(98765)} }
+        Mock Write-DiagnosticSnapshot { throw 'A skipped automatic launch must not write a snapshot.' }
+        Mock Save-WatchdogState { throw 'A skipped automatic launch must not persist a budget.' }
+        Mock Write-WatchdogEvent { throw 'A skipped automatic launch must not record a recovery attempt.' }
+        Mock Stop-CodexPackageProcesses { throw 'An automatic launch must not close the winning Desktop.' }
+        Mock Start-CodexDesktop { throw 'An existing Desktop must not reach the launcher.' }
+        Mock Set-PersistedUserCodexSelection { throw 'An automatic launch must preserve the selected core.' }
+
+        $result=Invoke-CodexRecovery -Automatic -Mode Launch -Config $config -State $state -Observation $observation `
+            -Decision (New-WatchdogDecision -Action Launch -Reason 'CodexDesktopAbsent') -Now $now
+
+        $result.Attempted | Should Be $false
+        $result.Skipped | Should Be $true
+        $result.Outcome | Should Be 'skipped'
+        $result.Reason | Should Be 'CodexAlreadyRunning'
+        ($state | ConvertTo-Json -Depth 12 -Compress) | Should Be $before
+        Assert-MockCalled Write-DiagnosticSnapshot -Times 0 -Exactly -Scope It
+        Assert-MockCalled Save-WatchdogState -Times 0 -Exactly -Scope It
+        Assert-MockCalled Write-WatchdogEvent -Times 0 -Exactly -Scope It
+        Assert-MockCalled Stop-CodexPackageProcesses -Times 0 -Exactly -Scope It
+        Assert-MockCalled Start-CodexDesktop -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-PersistedUserCodexSelection -Times 0 -Exactly -Scope It
+    }
+
+    It 'refunds the automatic Launch budget when the last launch-boundary check skips activation' {
+        $script:racePackage=[ordered]@{Found=$true;Version='fixture';DesktopExecutable='synthetic-desktop';AppServerExecutable='synthetic-core'}
+        $observation=New-TestObservation -DesktopPresent $false -AppServerPresent $false
+        $observation.Package=$script:racePackage
+        $state.automaticRecoveryHistoryUtc=@($now.AddMinutes(-20).ToString('o'))
+        $before=$state | ConvertTo-Json -Depth 12 -Compress
+        Mock Get-CodexPackageInfo { $script:racePackage }
+        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$false} }
+        Mock Get-CodexDesiredCoreIdentity { [ordered]@{Kind='Stock';Path='synthetic-core';Source='Stock';Sha256=('a'*64);Version='fixture'} }
+        Mock Get-CodexDesktopLaunchPlan { [ordered]@{Mode='Enhanced';CanLaunch=$true} }
+        Mock Write-DiagnosticSnapshot {}
+        Mock Save-WatchdogState {}
+        Mock Write-WatchdogEvent {}
+        Mock Start-CodexDesktop { [ordered]@{Mode='Skipped';Reason='CodexAlreadyRunning';LauncherPath=$null;LauncherProcessId=$null} }
+        Mock Stop-CodexPackageProcesses { throw 'A skipped automatic Launch must not stop a process.' }
+        Mock Wait-CodexHealthyProcesses { throw 'Skipped activation must not consume readiness time.' }
+        Mock Invoke-CoreSelectionRollback { throw 'Skipped activation must not attempt rollback.' }
+        Mock Set-PersistedUserCodexSelection { throw 'Skipped activation must not change the selected core.' }
+
+        $result=Invoke-CodexRecovery -Automatic -Mode Launch -Config $config -State $state -Observation $observation `
+            -Decision (New-WatchdogDecision -Action Launch -Reason 'CodexDesktopAbsent') -Now $now
+
+        $result.Attempted | Should Be $false
+        $result.Successful | Should Be $false
+        $result.Skipped | Should Be $true
+        $result.Outcome | Should Be 'skipped'
+        $result.Launch.Mode | Should Be 'Skipped'
+        ($state | ConvertTo-Json -Depth 12 -Compress) | Should Be $before
+        Assert-MockCalled Start-CodexDesktop -Times 1 -Exactly -Scope It -ParameterFilter { $OnlyIfAbsent }
+        Assert-MockCalled Stop-CodexPackageProcesses -Times 0 -Exactly -Scope It
+        Assert-MockCalled Wait-CodexHealthyProcesses -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-CoreSelectionRollback -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-PersistedUserCodexSelection -Times 0 -Exactly -Scope It
     }
 }
 
@@ -896,7 +1137,7 @@ Describe 'Configured core recognition and safe uncertainty' {
         $later=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now.AddMinutes(6)
         $later.Reason | Should Be 'AppServerMissingObservationWindow'
         $confirmed=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now.AddMinutes(7)
-        $confirmed.Action | Should Be 'Restart'
+        $confirmed.Action | Should Be 'Manual'
         $confirmed.Reason | Should Be 'AppServerMissing'
     }
 }
@@ -1350,6 +1591,7 @@ Describe 'Packaged Desktop log roots' {
         Mock Invoke-CodexRecovery { throw 'An ordinary healthy check must not recover.' }
         $result=Invoke-CodexWatchdogMain -RequestedAction Check -AsJson | ConvertFrom-Json
         $result.action | Should Be 'None'
+        $result.automaticRestartAllowed | Should Be $false
         $result.recovery | Should Be $null
         $event=Get-Content -LiteralPath $script:packageLogsConfig.EventLogPath -Tail 1 | ConvertFrom-Json
         $event.event | Should Be 'Check'
@@ -1487,13 +1729,13 @@ Describe 'Managed core switching and rollback gates' {
         [bool]$unmanifested.Error | Should Be $true
     }
 
-    It 'recognizes the hash-verified previous core and requests one switch to the selected future core' {
+    It 'recognizes the hash-verified previous core and requires a manual switch to the selected future core' {
         $observation.Process.CoreSwitchPending | Should Be $true
         $observation.Process.TrustedPreviousCorePresent | Should Be $true
         $observation.Process.AppServerStatus | Should Be 'Recognized'
         $observation.Process.AppServerProcessIdentities[0].classification | Should Be 'TrustedPrevious'
         $decision=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
-        $decision.Action | Should Be 'Restart'
+        $decision.Action | Should Be 'Manual'
         $decision.Reason | Should Be 'CoreSelectionChanged'
     }
 
@@ -1555,12 +1797,13 @@ Describe 'Managed core switching and rollback gates' {
         $desktopMismatch.AppServerStatus | Should Be 'Unknown'
     }
 
-    It 'switches when the old server is gone but the selected managed core is not running yet' {
+    It 'reports a manual core switch when the old server is gone but the selected managed core is not running yet' {
         $missing=Get-CodexProcessObservation -Package $newPackage -Processes @($previous.Desktop) -TrustedPreviousCore $state.lastHealthyCore
         $missing.AppServerStatus | Should Be 'Missing'
         $missing.CoreSwitchPending | Should Be $true
         $observation.Process=$missing
         $decision=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
+        $decision.Action | Should Be 'Manual'
         $decision.Reason | Should Be 'CoreSelectionChanged'
     }
 
@@ -1626,7 +1869,7 @@ Describe 'Managed core switching and rollback gates' {
         $changed=Get-WatchdogDecision -Observation $observation -State $state -Config $config -Now $now
 
         $state.coreSwitchAttempt | Should Be $null
-        $changed.Action | Should Be 'Restart'
+        $changed.Action | Should Be 'Manual'
         $changed.Reason | Should Be 'CoreSelectionChanged'
     }
 
@@ -1875,6 +2118,42 @@ Describe 'Enhanced desktop launch selection' {
         $failure.Exception.Message | Should Be 'Fixture launch error'
         Assert-MockCalled Invoke-CodexNativeActivation -Times 0 -Exactly -Scope It
     }
+
+    It 'skips a stale <Mode> launch plan when a Desktop appears before activation' -TestCases @(
+        @{Mode='Native'}
+        @{Mode='Enhanced'}
+    ) {
+        param($Mode)
+        if($Mode -eq 'Enhanced') { $null=New-EnhancedLauncherFixture -UserHome $userHome }
+        $plan=Get-CodexDesktopLaunchPlan -Package $package -UserHome $userHome
+        $plan.Mode | Should Be $Mode
+        $preferences=Join-Path $userHome 'Programs\better-codex\profile.json'
+        $null=New-Item -ItemType Directory -Path (Split-Path -Parent $preferences) -Force
+        Set-Content -LiteralPath $preferences -Value '{"widthRem":137}'
+        $widthHash=(Get-FileHash -LiteralPath $preferences).Hash
+        $priorProcessCore=[Environment]::GetEnvironmentVariable('CODEX_CLI_PATH','Process')
+        # The plan was made while absent; the launch boundary observes the winner of the race.
+        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$true;RootProcessIds=@(98765)} }
+        Mock Start-Process { throw 'A live Desktop must prevent wrapper execution.' }
+        Mock Invoke-CodexNativeActivation { throw 'A live Desktop must prevent native activation.' }
+        Mock Get-CodexAppServerOverride { throw 'Skipped launch must not synchronize the child core environment.' }
+        Mock Set-PersistedUserCodexSelection { throw 'Skipped launch must not change the selected core.' }
+
+        $launch=Start-CodexDesktop -Package $package -UserHome $userHome -LaunchPlan $plan -OnlyIfAbsent
+
+        $launch.Mode | Should Be 'Skipped'
+        $launch.Reason | Should Be 'CodexAlreadyRunning'
+        $launch.LauncherPath | Should Be $null
+        $launch.LauncherProcessId | Should Be $null
+        (Get-FileHash -LiteralPath $preferences).Hash | Should Be $widthHash
+        ([Environment]::GetEnvironmentVariable('CODEX_CLI_PATH','Process') -ceq $priorProcessCore) | Should Be $true
+        Assert-MockCalled Get-CodexProcessObservation -Times 1 -Exactly -Scope It
+        Assert-MockCalled Start-Process -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-CodexNativeActivation -Times 0 -Exactly -Scope It
+        Assert-MockCalled Get-CodexAppServerOverride -Times 0 -Exactly -Scope It
+        Assert-MockCalled Set-PersistedUserCodexSelection -Times 0 -Exactly -Scope It
+        if($Mode -eq 'Enhanced') { (Test-Path -LiteralPath (Join-Path $userHome '.agents\skills\better-codex\invoked.json')) | Should Be $false }
+    }
 }
 
 Describe 'Managed Startup launch routing' {
@@ -1936,7 +2215,7 @@ $Action | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'action.txt')
         $null=New-EnhancedLauncherFixture -UserHome $config.UserHome
         Mock Get-WatchdogConfig { $config }
         Mock Get-CodexPackageInfo { [ordered]@{Found=$true;Aumid='OpenAI.Codex_fixture!App'} }
-        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$true} }
+        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$false} }
         Mock Get-CodexObservation { throw 'Startup must not query Remote/DB recovery health.' }
         Mock Read-WatchdogState { throw 'Startup must not read recovery state.' }
         Mock Start-CodexDesktop { throw 'WhatIf must not launch any application.' }
@@ -1945,6 +2224,48 @@ $Action | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'action.txt')
         $result.launch.Mode | Should Be 'Enhanced'
         ($result.launch.Arguments -match '-Admin|-Width|-RuntimeDirectory') | Should Be $false
         Assert-MockCalled Start-CodexDesktop -Times 0 -Exactly -Scope It
+    }
+
+    It 'keeps an existing Enhanced Desktop untouched during LaunchOnly with WhatIf=<Preview>' -TestCases @(
+        @{Preview=$false}
+        @{Preview=$true}
+    ) {
+        param($Preview)
+        $null=New-EnhancedLauncherFixture -UserHome $config.UserHome
+        Mock Get-WatchdogConfig { $config }
+        Mock Get-CodexPackageInfo { [ordered]@{Found=$true;Aumid='OpenAI.Codex_fixture!App'} }
+        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$true} }
+        Mock Get-CodexObservation { throw 'Idempotent startup must not query recovery health.' }
+        Mock Read-WatchdogState { throw 'Idempotent startup must not read recovery state.' }
+        Mock Start-CodexDesktop { throw 'The canonical wrapper must not be invoked for a living Enhanced Desktop.' }
+
+        $result=Invoke-CodexWatchdogMain -RequestedAction LaunchOnly -AsJson -WhatIfMode:$Preview | ConvertFrom-Json
+
+        $result.action | Should Be 'None'
+        $result.reason | Should Be 'CodexAlreadyRunning'
+        $result.launch.Mode | Should Be 'Enhanced'
+        Assert-MockCalled Start-CodexDesktop -Times 0 -Exactly -Scope It
+        Assert-MockCalled Get-CodexObservation -Times 0 -Exactly -Scope It
+        Assert-MockCalled Read-WatchdogState -Times 0 -Exactly -Scope It
+    }
+
+    It 'preserves a cold Enhanced launch through LaunchOnly without recovery or core changes' {
+        $null=New-EnhancedLauncherFixture -UserHome $config.UserHome
+        Mock Get-WatchdogConfig { $config }
+        Mock Get-CodexPackageInfo { [ordered]@{Found=$true;Aumid='OpenAI.Codex_fixture!App'} }
+        Mock Get-CodexProcessObservation { [ordered]@{DesktopPresent=$false} }
+        Mock Get-CodexObservation { throw 'Cold startup must not query recovery health.' }
+        Mock Read-WatchdogState { throw 'Cold startup must not read recovery state.' }
+        Mock Set-PersistedUserCodexSelection { throw 'Startup must preserve the selected core.' }
+        Mock Start-CodexDesktop { [ordered]@{Mode='Enhanced';LauncherPath='synthetic-launcher';LauncherProcessId=12345} }
+
+        $result=Invoke-CodexWatchdogMain -RequestedAction LaunchOnly -AsJson | ConvertFrom-Json
+
+        $result.action | Should Be 'LaunchRequested'
+        $result.reason | Should Be 'LogonLaunchRequested'
+        $result.launch.Mode | Should Be 'Enhanced'
+        Assert-MockCalled Start-CodexDesktop -Times 1 -Exactly -Scope It
+        Assert-MockCalled Set-PersistedUserCodexSelection -Times 0 -Exactly -Scope It
     }
 
     It 'keeps native fallback idempotent when the skill is removed and Codex is already running' {
@@ -2039,6 +2360,7 @@ Describe 'Watchdog validation diagnostics' {
         $validation = Get-TriggerValidationReport -Decision $decision -Observation $observation -State $state -Config $config -Now $now
         $check = $validation.checks[0]
 
+        $decision.Action | Should Be 'Manual'
         $decision.Reason | Should Be 'ConfirmedStaleTask'
         $check.name | Should Be 'LifecycleProgressFresh'
         $check.status | Should Be 'failed'

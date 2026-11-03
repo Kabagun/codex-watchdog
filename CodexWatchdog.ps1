@@ -2023,7 +2023,7 @@ function Get-WatchdogDecision {
             return New-WatchdogDecision -Action 'None' -Reason 'HealthyTaskProtectsSharedApp' -ProtectedByThreadIds @($protectors | ForEach-Object ThreadId)
         }
         if ($suppression) { return New-WatchdogDecision -Action 'None' -Reason $suppression }
-        return New-WatchdogDecision -Action 'Restart' -Reason 'CoreSelectionChanged'
+        return New-WatchdogDecision -Action 'Manual' -Reason 'CoreSelectionChanged'
     }
     if (-not $Observation.Process.AppServerPresent) {
         if ($State.coreSwitchAttempt -and [string](Get-JsonPropertyValue -Object $State.coreSwitchAttempt -Name 'status') -in @('Failed','RollbackAttempted')) {
@@ -2041,7 +2041,7 @@ function Get-WatchdogDecision {
         if (($Now - $missingSince).TotalMinutes -ge $Config.AppServerMissingMinutes -and
             $State.appServerMissingChecks -ge $Config.AppServerMissingChecks) {
             if ($suppression) { return New-WatchdogDecision -Action 'None' -Reason $suppression }
-            return New-WatchdogDecision -Action 'Restart' -Reason 'AppServerMissing'
+            return New-WatchdogDecision -Action 'Manual' -Reason 'AppServerMissing'
         }
         return New-WatchdogDecision -Action 'None' -Reason 'AppServerMissingObservationWindow'
     }
@@ -2056,7 +2056,7 @@ function Get-WatchdogDecision {
             return New-WatchdogDecision -Action 'None' -Reason 'HealthyTaskProtectsSharedApp' -ThreadIds $suspectIds -ProtectedByThreadIds @($otherProtectors | ForEach-Object ThreadId)
         }
         if ($suppression) { return New-WatchdogDecision -Action 'None' -Reason $suppression -ThreadIds $suspectIds }
-        return New-WatchdogDecision -Action 'Restart' -Reason 'PreDispatchLifecycleFreeze' -ThreadIds $suspectIds
+        return New-WatchdogDecision -Action 'Manual' -Reason 'PreDispatchLifecycleFreeze' -ThreadIds $suspectIds
     }
 
     if ($confirmedStale.Count -gt 0) {
@@ -2065,7 +2065,7 @@ function Get-WatchdogDecision {
             return New-WatchdogDecision -Action 'None' -Reason 'HealthyTaskProtectsSharedApp' -ThreadIds $confirmedStale -ProtectedByThreadIds @($otherProtectors | ForEach-Object ThreadId)
         }
         if ($suppression) { return New-WatchdogDecision -Action 'None' -Reason $suppression -ThreadIds $confirmedStale }
-        return New-WatchdogDecision -Action 'Restart' -Reason 'ConfirmedStaleTask' -ThreadIds $confirmedStale
+        return New-WatchdogDecision -Action 'Manual' -Reason 'ConfirmedStaleTask' -ThreadIds $confirmedStale
     }
 
     if ($Observation.Remote.RepeatedFailure) {
@@ -2073,7 +2073,7 @@ function Get-WatchdogDecision {
             return New-WatchdogDecision -Action 'None' -Reason 'HealthyTaskProtectsSharedApp' -ProtectedByThreadIds @($protectors | ForEach-Object ThreadId)
         }
         if ($suppression) { return New-WatchdogDecision -Action 'None' -Reason $suppression }
-        return New-WatchdogDecision -Action 'Restart' -Reason 'RepeatedRemoteTransportFailure'
+        return New-WatchdogDecision -Action 'Manual' -Reason 'RepeatedRemoteTransportFailure'
     }
 
     if ($Observation.Threads.Count -eq 0) {
@@ -2192,8 +2192,12 @@ function Start-CodexDesktop {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Package,
         [string]$UserHome = [Environment]::GetFolderPath('UserProfile'),
-        [System.Collections.IDictionary]$LaunchPlan
+        [System.Collections.IDictionary]$LaunchPlan,
+        [switch]$OnlyIfAbsent
     )
+    if ($OnlyIfAbsent -and (Get-CodexProcessObservation -Package $Package).DesktopPresent) {
+        return [ordered]@{Mode='Skipped';Reason='CodexAlreadyRunning';LauncherPath=$null;LauncherProcessId=$null}
+    }
     $plan = if ($LaunchPlan) { $LaunchPlan } else { Get-CodexDesktopLaunchPlan -Package $Package -UserHome $UserHome }
     if (-not $plan.CanLaunch) { throw $plan.Error }
     $override = Get-CodexAppServerOverride
@@ -2213,6 +2217,11 @@ function Start-CodexDesktop {
         } else {
             Remove-Item -LiteralPath 'Env:\CODEX_CLI_PATH' -ErrorAction SilentlyContinue
         }
+    }
+    # Resolve preferences first, then recheck before invoking a launcher that
+    # could otherwise turn a stale absent-app observation into a live restart.
+    if ($OnlyIfAbsent -and (Get-CodexProcessObservation -Package $Package).DesktopPresent) {
+        return [ordered]@{Mode='Skipped';Reason='CodexAlreadyRunning';LauncherPath=$null;LauncherProcessId=$null}
     }
     if ($plan.Mode -eq 'Enhanced') {
         try {
@@ -2835,6 +2844,15 @@ function Invoke-CoreSelectionRollback {
     }
 }
 
+function New-CodexSkippedLaunchRecovery {
+    $launch=[ordered]@{Mode='Skipped';Reason='CodexAlreadyRunning';LauncherPath=$null;LauncherProcessId=$null}
+    return [ordered]@{
+        Attempted=$false;Mode='Launch';LaunchMethod='Skipped';Launch=$launch;Successful=$false
+        Outcome='skipped';Skipped=$true;Reason='CodexAlreadyRunning'
+        Validation=[ordered]@{phase='recheck';checks=@(New-ValidationCheck -Name 'DesktopAlreadyRunning' -Status 'passed' -Expected $true -Observed $true)}
+    }
+}
+
 function Invoke-CodexRecovery {
     param(
         [Parameter(Mandatory)][ValidateSet('Launch', 'Restart')][string]$Mode,
@@ -2846,6 +2864,18 @@ function Invoke-CodexRecovery {
         [switch]$Automatic
     )
 
+    # Process/lifecycle/Remote evidence is not permission to interrupt a live
+    # Desktop. Keep this execution gate even if a future decision regresses.
+    if ($Automatic -and $Mode -eq 'Restart') {
+        throw 'Automatic restart is disabled. Restarting a running Desktop requires explicit -Action Restart.'
+    }
+    if ($Automatic) {
+        if ($Observation.Process.DesktopPresent -or (Get-CodexProcessObservation -Package $Observation.Package).DesktopPresent) {
+            return New-CodexSkippedLaunchRecovery
+        }
+    }
+
+    $historyBefore=@($State.automaticRecoveryHistoryUtc)
     Write-DiagnosticSnapshot -Config $Config -Observation $Observation -Decision $Decision
     if ($Automatic) { $State.automaticRecoveryHistoryUtc = @($State.automaticRecoveryHistoryUtc) + $Now.ToString('o') }
 
@@ -2888,7 +2918,14 @@ function Invoke-CodexRecovery {
             Stop-CodexPackageProcesses -Package $freshPackage -Config $Config -TrustedPreviousCore $State.lastHealthyCore -ExpectedCore $expectedCore
             $stopCompleted = $true
         }
-        $launch = Start-CodexDesktop -Package $freshPackage -UserHome $Config.UserHome -LaunchPlan $launchPlan
+        $launch = Start-CodexDesktop -Package $freshPackage -UserHome $Config.UserHome -LaunchPlan $launchPlan -OnlyIfAbsent:$Automatic
+        if ($Automatic -and $launch.Mode -eq 'Skipped') {
+            $State.automaticRecoveryHistoryUtc=$historyBefore
+            $skipped=New-CodexSkippedLaunchRecovery
+            Write-WatchdogEvent -Config $Config -Event $Mode -Reason $skipped.Reason -Outcome 'skipped' `
+                -ThreadIds $Decision.ThreadIds -ProcessIds @() -PackageVersion $freshPackage.Version -Validation $skipped.Validation
+            return $skipped
+        }
         $launchStarted = $true
         $State.startupGraceUntilUtc = $Now.AddMinutes($Config.StartupGraceMinutes).ToString('o')
         $waitResult = Wait-CodexHealthyProcesses -Config $Config -InitialPackage $freshPackage `
@@ -3218,6 +3255,7 @@ function ConvertTo-PublicResult {
     return [ordered]@{
         timestampUtc          = $Observation.TimestampUtc
         action                = if ($WhatIfMode -and $Decision.Action -in @('Launch', 'Restart')) { "Would$($Decision.Action)" } else { $Decision.Action }
+        automaticRestartAllowed = $false
         reason                = $Decision.Reason
         packageVersion        = $Observation.Package.Version
         desktopPresent        = $Observation.Process.DesktopPresent
@@ -3308,13 +3346,14 @@ function Invoke-CodexWatchdogMain {
         $package = Get-CodexPackageInfo -Config $config
         $plan = Get-CodexDesktopLaunchPlan -Package $package -UserHome $config.UserHome
         $process = Get-CodexProcessObservation -Package $package
-        if ($plan.Mode -eq 'Native' -and $process.DesktopPresent) {
+        if ($process.DesktopPresent) {
             Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{action='None';reason='CodexAlreadyRunning';launch=$plan})
         } elseif ($WhatIfMode) {
             Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{action='WouldLaunch';reason='LogonLaunchRequested';launch=$plan})
         } else {
-            $launch = Start-CodexDesktop -Package $package -LaunchPlan $plan
-            Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{action='LaunchRequested';reason='LogonLaunchRequested';launch=$launch})
+            $launch = Start-CodexDesktop -Package $package -LaunchPlan $plan -OnlyIfAbsent
+            $skipped=$launch.Mode -eq 'Skipped'
+            Write-WatchdogResult -AsJson:$AsJson -Result ([ordered]@{action=$(if($skipped){'None'}else{'LaunchRequested'});reason=$(if($skipped){'CodexAlreadyRunning'}else{'LogonLaunchRequested'});launch=$launch})
         }
         return
     }
@@ -3366,6 +3405,9 @@ function Invoke-CodexWatchdogMain {
         $recovery = $null
         if (-not $WhatIfMode -and $RequestedAction -ne 'Status' -and $decision.Action -in @('Launch', 'Restart')) {
             $recovery = Invoke-CodexRecovery -Mode $decision.Action -Config $config -State $workingState -Observation $observation -Decision $decision -Now $now -Automatic:($RequestedAction -eq 'Check')
+            if ([bool](Get-JsonPropertyValue -Object $recovery -Name 'Skipped')) {
+                $decision.Action='None';$decision.Reason='CodexAlreadyRunning';$decision.Validation=$recovery.Validation
+            }
         }
 
         if (-not $WhatIfMode -and $RequestedAction -ne 'Status') {

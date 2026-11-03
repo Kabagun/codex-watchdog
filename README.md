@@ -1,9 +1,11 @@
 # Codex Remote Watchdog
 
-This Windows watchdog protects Codex Desktop and Mobile Remote from locally
-observable crashes and task-lifecycle freezes. It checks once per minute while
-the installing user's desktop session is logged in. It does not restart Codex merely
-because Codex is idle.
+This Windows watchdog monitors Codex Desktop and Mobile Remote for locally
+observable failures and task-lifecycle freezes. It checks once per minute while
+the installing user's desktop session is logged in. Automatic checks can launch
+an absent Desktop; restarting a running Desktop requires an explicit
+`-Action Restart`. Remote errors, apparently stale tasks and a missing app-server
+are reported without closing the running application.
 
 ## Requirements
 
@@ -66,9 +68,10 @@ remains the fallback.
 
 `-Action LaunchOnly` shares that selector but does not use Remote enrollment,
 SQLite health or recovery state as a prerequisite for ordinary app startup.
-It can apply normal Enhanced settings to an existing app; when the skill is
-absent and native Codex is already running, it does nothing. This action never
-closes or force-stops an application. A launch request does not prove rendered
+If Desktop is already running, it does nothing in both Enhanced and native modes.
+It rechecks presence before requesting a cold launch, preserving an app that
+appeared after the initial observation. This action never requests a restart or
+force-stops an application. A launch request does not prove rendered
 width, icon appearance or any actual process privilege.
 
 `Set-CodexStartupLauncher` can explicitly create/read back one owned
@@ -88,14 +91,15 @@ not delete the source or change independently configured app startup.
 | --- | --- |
 | Codex is healthy or idle | Do nothing |
 | Desktop and app-server are absent | Launch Codex, then allow five minutes of startup grace |
-| Desktop exists but app-server is absent | Restart after five minutes and three consecutive checks |
+| Desktop exists but app-server is absent | Report manual recovery after five minutes and three consecutive checks; leave Desktop open |
 | A live direct app-server child uses an unrecognized or unreadable executable path | Report a manual condition; do not close or restart Codex |
-| `task_started` has no dispatch/model/tool progress | Restart after three minutes if no healthy task would be interrupted |
-| A progressed task has no progress | Mark stale after 60 minutes and require five more unchanged minutes |
+| `task_started` has no dispatch/model/tool progress | Report manual recovery after three minutes if no observed healthy task protects the app |
+| A progressed task has no progress | Mark stale after 60 minutes and five more unchanged minutes; report manual recovery |
 | A tool call, user-input wait, or approval is outstanding | Protect the task indefinitely |
 | Another task remains healthy or active | Do not restart the shared Codex app |
 | A single Remote disconnect occurs | Ignore it |
-| Remote transport repeatedly fails | Restart only after at least three failures spanning five minutes, with a recent failure and no later success |
+| Remote transport repeatedly fails | Report manual recovery after at least three failures spanning five minutes, with a recent failure and no later success |
+| A selected core change needs a new Desktop process | Report manual recovery; preserve the running app and existing core selection |
 | Remote auth, MFA, 401, 403, 409, or disabled enrollment occurs | Report a manual condition; do not restart-loop |
 | A Codex SQLite integrity check is not healthy | Report a manual condition; do not recover automatically |
 
@@ -103,7 +107,9 @@ Only lifecycle event metadata is inspected. Authentication and transport
 classification is restricted to Codex's dedicated Remote transport logger so
 text inside prompts or responses cannot accidentally trigger a recovery.
 Rollouts from an older app-server process generation are excluded from active
-task decisions.
+task decisions. The bounded lifecycle observation cannot prove an application is
+idle merely because it found no protecting task. Automatic checks therefore
+never promote these signals into permission to stop a running Desktop.
 
 The app-server path can be the stock package executable, a versioned executable
 under `%LOCALAPPDATA%\OpenAI\Codex\bin`, or the exact existing `codex.exe`
@@ -121,16 +127,28 @@ the owned child's PID/path for inspection. It never treats that path as trusted 
 force-stops it. The stop routine also refuses to close Codex while an unknown
 direct server exists. Unrelated CLI processes and nested agent tool servers are
 not recognized as the desktop server. A genuinely missing server retains the
-normal five-minute, three-check recovery rule.
+five-minute, three-check observation rule, then reports manual recovery.
 
 ## Recovery sequence and limits
 
-Before recovery, the watchdog records a redacted snapshot containing only
+An automatic `Check` reports `Manual` with the original fault reason and its
+validation evidence when recovery of a running Desktop needs a restart.
+`Status` and check results expose `automaticRestartAllowed=false`. An independent
+execution guard also rejects an automatic `Restart` before snapshots, counter
+updates, shutdown, launch or core-selection operations, even if a caller bypasses
+the decision rules.
+
+Automatic launches recheck that Desktop is absent. If it reappeared, recovery is
+skipped without spending the attempt budget, setting a failure cooldown or
+invoking the Enhanced launcher. Monitoring and recovery of an already absent
+application remain enabled.
+
+Before an actual recovery attempt, the watchdog records a redacted snapshot containing only
 timestamps, the reason, package version, exact Codex process IDs, task IDs,
 statuses, and event types. It then:
 
-1. Requests a normal close and waits up to 15 seconds.
-2. Force-stops only the current AppX `ChatGPT.exe` and its descended
+1. For explicit manual restart only, requests a normal close and waits up to 15 seconds.
+2. For explicit manual restart only, force-stops the current AppX `ChatGPT.exe` and its descended
    `app-server` executable. The latter must use a stock/versioned path or the exact
    valid configured `CODEX_CLI_PATH`; unrelated `codex.exe` processes are excluded.
    Unknown live direct app-server children block the stop operation.
@@ -141,7 +159,7 @@ statuses, and event types. It then:
 4. Waits up to 60 seconds for both the desktop root and app-server.
 5. Rechecks both SQLite databases and the enabled Remote enrollment.
 
-Automatic launch/restart attempts are limited to three per rolling hour. A
+Automatic launch attempts are limited to three per rolling hour. A
 failed recovery creates a ten-minute cooldown. Manual `-Action Restart`
 bypasses the automatic decision and rate limit but keeps the exact-process
 safety checks and post-restart verification.
