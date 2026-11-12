@@ -1412,33 +1412,12 @@ function Get-RemoteTransportObservation {
 
     $since = $Now.AddMinutes(-$Config.RemoteFailureWindowMinutes).ToUnixTimeSeconds()
     $query = @"
-SELECT ts, level,
-CASE
-  WHEN lower(coalesce(feedback_log_body, '')) LIKE '%mfa%' THEN 'auth_mfa'
-  WHEN lower(coalesce(feedback_log_body, '')) LIKE '%unauthorized%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%status%401%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%http%401%' THEN 'auth_401'
-  WHEN lower(coalesce(feedback_log_body, '')) LIKE '%forbidden%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%status%403%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%http%403%' THEN 'auth_403'
-  WHEN lower(coalesce(feedback_log_body, '')) LIKE '%conflict%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%status%409%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%http%409%' THEN 'auth_409'
-  WHEN lower(coalesce(feedback_log_body, '')) LIKE '%skipping auto-attach for closed connection%' THEN 'isolated_disconnect'
-  WHEN lower(coalesce(feedback_log_body, '')) LIKE '%fail%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%error%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%disconnect%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%closed%' THEN 'failure'
-  WHEN lower(coalesce(feedback_log_body, '')) LIKE '%connected%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%connection established%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%attached%'
-    OR lower(coalesce(feedback_log_body, '')) LIKE '%registered%' THEN 'success'
-  ELSE 'other'
-END
+SELECT json_object('ts', ts, 'level', level, 'body', coalesce(feedback_log_body, ''))
 FROM logs
 WHERE ts >= $since
-  AND target LIKE 'codex_app_server_transport::transport::remote_control%'
-ORDER BY ts ASC;
+  AND (target = 'codex_app_server_transport::transport::remote_control'
+    OR target GLOB 'codex_app_server_transport::transport::remote_control::*')
+ORDER BY ts ASC, rowid ASC;
 "@
 
     try {
@@ -1447,23 +1426,42 @@ ORDER BY ts ASC;
         return $empty
     }
 
-    $events = @($rows | ForEach-Object {
-        $parts = $_ -split '\|', 3
-        if ($parts.Count -eq 3) {
-            [ordered]@{ Timestamp = [long]$parts[0]; Level = $parts[1]; Category = $parts[2] }
-        }
+    # SQL LIKE wildcards can span unrelated fields (including UUIDs and retry
+    # delays). Require the status and code to be adjacent, and ignore URL values.
+    # Keep message bodies in memory only; diagnostics retain categories alone.
+    $statusPattern = '(?ix)(?<![\w/.-])(?:' +
+        '(?:http[_ -]?)?status(?:[_ -]?code)?["'']?\s*[:=]?\s*["'']?' +
+        '|http(?:/\d(?:\.\d)?)?\s+(?:status\s*[:=]?\s*)?' +
+        ')(?<code>401|403|409)(?![\w.])'
+    $events = @(foreach ($row in $rows) {
+        $entry = $row | ConvertFrom-Json -ErrorAction Stop
+        $body = [regex]::Replace([string]$entry.body, '(?i)\b[a-z][a-z0-9+.-]*://[^\s"<>]+', '[url]')
+        $code = [regex]::Match($body, $statusPattern)
+        $category = if ($body -match '(?i)\bmfa\b|\bmulti[- _]factor authentication\b') { 'auth_mfa' }
+            elseif ($code.Success) { 'auth_' + $code.Groups['code'].Value }
+            elseif ($body -match '(?i)\bunauthorized\b') { 'auth_401' }
+            elseif ($body -match '(?i)\bforbidden\b') { 'auth_403' }
+            elseif ($body -match '(?i)\bconflict\b') { 'auth_409' }
+            elseif ($body -match '(?i)skipping auto-attach for closed connection') { 'isolated_disconnect' }
+            elseif ($body -match '(?i)(?<!\w)next_status\s*=\s*Connected(?=[\s,;]|$)|^\s*(?:connected|attached|registered)(?:\s|$)|\bconnection established\b') { 'success' }
+            elseif ($body -match '(?i)\b(?:failed|failure|errors?|errored|disconnect(?:ed)?|closed)\b') { 'failure' }
+            else { 'other' }
+        [ordered]@{ Timestamp = [long]$entry.ts; Level = [string]$entry.level; Category = $category }
     })
-    $manual = @($events | Where-Object { $_.Category -like 'auth_*' } | Select-Object -Last 1)
+    # Array position also orders events emitted in the same second.
+    $lastSuccess = -1
+    for ($index = 0; $index -lt $events.Count; $index++) {
+        if ($events[$index].Category -eq 'success') { $lastSuccess = $index }
+    }
+    $unresolved = @($events | Select-Object -Skip ($lastSuccess + 1))
+    $manual = @($unresolved | Where-Object { $_.Category -like 'auth_*' } | Select-Object -Last 1)
     if ($manual.Count -gt 0) {
         $empty.ManualCondition = $true
         $empty.ManualReason = $manual[0].Category
         return $empty
     }
 
-    $lastSuccess = @($events | Where-Object Category -eq 'success' | ForEach-Object Timestamp | Measure-Object -Maximum).Maximum
-    $failures = @($events | Where-Object {
-        $_.Category -eq 'failure' -and (-not $lastSuccess -or $_.Timestamp -gt $lastSuccess)
-    })
+    $failures = @($unresolved | Where-Object Category -eq 'failure')
     if ($failures.Count -eq 0) {
         return $empty
     }
@@ -1577,23 +1575,25 @@ function Get-RolloutObservation {
     if ($events.Count -eq 0) { return $null }
 
     $lastStart = -1
-    $lastComplete = -1
+    $lastTerminal = -1
     for ($index = 0; $index -lt $events.Count; $index++) {
         $event = $events[$index]
         if ($event.TopType -eq 'event_msg' -and $event.PayloadType -eq 'task_started') { $lastStart = $index }
-        if ($event.TopType -eq 'event_msg' -and $event.PayloadType -eq 'task_complete') { $lastComplete = $index }
+        if ($event.TopType -eq 'event_msg' -and $event.PayloadType -in @('task_complete', 'turn_aborted')) { $lastTerminal = $index }
     }
 
     $segmentStart = -1
     $inferred = $false
-    if ($lastStart -gt $lastComplete) {
+    if ($lastStart -gt $lastTerminal) {
         $segmentStart = $lastStart
-    } else {
-        $progressAfterComplete = @($events | Where-Object {
-            $_.Sequence -gt $lastComplete -and (Test-IsLifecycleProgressEvent $_)
+    } elseif ($lastTerminal -lt 0) {
+        # A bounded tail may omit task_started. Infer activity only when no
+        # terminal boundary is visible; late bookkeeping cannot reopen a turn.
+        $progressWithoutStart = @($events | Where-Object {
+            Test-IsLifecycleProgressEvent $_
         })
-        if ($progressAfterComplete.Count -gt 0) {
-            $segmentStart = $progressAfterComplete[0].Sequence
+        if ($progressWithoutStart.Count -gt 0) {
+            $segmentStart = $progressWithoutStart[0].Sequence
             $inferred = $true
         }
     }

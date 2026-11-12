@@ -16,6 +16,12 @@ are reported without closing the running application.
   and online.
 - An enabled Codex Desktop Remote enrollment.
 
+For continuous phone access, disable automatic sleep and hibernation in every
+power plan you use (including any night plan), on both AC and battery power as
+appropriate. Windows can still turn off the display or lock. The watchdog does
+not change power plans, prevent sleep, or wake a sleeping computer; checks resume
+when Windows runs the user's session again.
+
 Check the installed program paths with `Get-Command pwsh.exe, sqlite3.exe`.
 Keep `CodexWatchdog.ps1` and `CodexWatchdogLauncher.vbs` together in a stable
 directory. The scheduled task records their absolute paths; run `Install`
@@ -106,6 +112,14 @@ not delete the source or change independently configured app startup.
 Only lifecycle event metadata is inspected. Authentication and transport
 classification is restricted to Codex's dedicated Remote transport logger so
 text inside prompts or responses cannot accidentally trigger a recovery.
+Authentication status codes must be adjacent to an HTTP/status label; digits in
+retry delays, identifiers and URLs do not count. A later successful connection
+clears earlier transport and authentication failures, including events in the
+same second, in database insertion order.
+Both `task_complete` and `turn_aborted` close a task. Trailing bookkeeping or tool
+outputs cannot reopen it; a subsequent `task_started` begins a new task. Activity
+can still be inferred when the bounded rollout tail contains no start or terminal
+boundary.
 Rollouts from an older app-server process generation are excluded from active
 task decisions. The bounded lifecycle observation cannot prove an application is
 idle merely because it found no protecting task. Automatic checks therefore

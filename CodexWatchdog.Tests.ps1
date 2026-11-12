@@ -898,6 +898,97 @@ Describe 'Codex rollout lifecycle parsing' {
         $thread = Get-RolloutObservation -Path $path -Now $now
         ($null -eq $thread) | Should Be $true
     }
+
+    It 'stops tracking an aborted task as active' {
+        $path = Write-RolloutFixture -ThreadId '10000000-0000-0000-0000-000000000005' -Events @(
+            New-FixtureEvent -Timestamp $now.AddMinutes(-5) -TopType 'event_msg' -PayloadType 'task_started'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-4) -TopType 'event_msg' -PayloadType 'agent_reasoning'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-3) -TopType 'event_msg' -PayloadType 'turn_aborted'
+        )
+        $thread = Get-RolloutObservation -Path $path -Now $now
+        ($null -eq $thread) | Should Be $true
+    }
+
+    It 'does not protect an aborted task with an outstanding tool call' {
+        $path = Write-RolloutFixture -ThreadId '10000000-0000-0000-0000-000000000006' -Events @(
+            New-FixtureEvent -Timestamp $now.AddMinutes(-100) -TopType 'event_msg' -PayloadType 'task_started'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-99) -TopType 'response_item' -PayloadType 'function_call' -CallId 'abandoned-call'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-90) -TopType 'event_msg' -PayloadType 'turn_aborted'
+        )
+        $thread = Get-RolloutObservation -Path $path -Now $now
+        ($null -eq $thread) | Should Be $true
+    }
+
+    It 'does not reopen an aborted task for trailing lifecycle bookkeeping' {
+        $path = Write-RolloutFixture -ThreadId '10000000-0000-0000-0000-000000000007' -Events @(
+            New-FixtureEvent -Timestamp $now.AddMinutes(-6) -TopType 'event_msg' -PayloadType 'task_started'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-5) -TopType 'response_item' -PayloadType 'custom_tool_call' -CallId 'abandoned-custom-call'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-4) -TopType 'event_msg' -PayloadType 'turn_aborted'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-3) -TopType 'response_item' -PayloadType 'custom_tool_call_output' -CallId 'abandoned-custom-call'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-2) -TopType 'event_msg' -PayloadType 'item_completed'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-1) -TopType 'event_msg' -PayloadType 'token_count'
+        )
+        $thread = Get-RolloutObservation -Path $path -Now $now
+        ($null -eq $thread) | Should Be $true
+    }
+
+    It 'detects a new task after an aborted task without inheriting its open tool' {
+        $path = Write-RolloutFixture -ThreadId '10000000-0000-0000-0000-000000000008' -Events @(
+            New-FixtureEvent -Timestamp $now.AddMinutes(-8) -TopType 'event_msg' -PayloadType 'task_started'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-7) -TopType 'response_item' -PayloadType 'function_call' -CallId 'old-call'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-6) -TopType 'event_msg' -PayloadType 'turn_aborted'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-5) -TopType 'event_msg' -PayloadType 'token_count'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-2) -TopType 'event_msg' -PayloadType 'task_started'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-1) -TopType 'turn_context'
+        )
+        $thread = Get-RolloutObservation -Path $path -Now $now
+        $thread = Set-ThreadHealthStatus -Thread $thread -Config $config -Now $now
+        $thread.OutstandingTool | Should Be $false
+        $thread.Status | Should Be 'Healthy'
+        $thread.TaskStartedUtc | Should Be $now.AddMinutes(-2)
+    }
+
+    It 'does not reopen a completed task for trailing bookkeeping' {
+        $path = Write-RolloutFixture -ThreadId '10000000-0000-0000-0000-000000000009' -Events @(
+            New-FixtureEvent -Timestamp $now.AddMinutes(-5) -TopType 'event_msg' -PayloadType 'task_started'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-4) -TopType 'event_msg' -PayloadType 'task_complete'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-3) -TopType 'event_msg' -PayloadType 'token_count'
+        )
+        $thread = Get-RolloutObservation -Path $path -Now $now
+        ($null -eq $thread) | Should Be $true
+    }
+
+    It 'detects a new task after a completed task' {
+        $path = Write-RolloutFixture -ThreadId '10000000-0000-0000-0000-000000000010' -Events @(
+            New-FixtureEvent -Timestamp $now.AddMinutes(-5) -TopType 'event_msg' -PayloadType 'task_started'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-4) -TopType 'event_msg' -PayloadType 'task_complete'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-2) -TopType 'event_msg' -PayloadType 'task_started'
+        )
+        $thread = Get-RolloutObservation -Path $path -Now $now
+        $thread = Set-ThreadHealthStatus -Thread $thread -Config $config -Now $now
+        $thread.Status | Should Be 'Starting'
+        $thread.TaskStartedUtc | Should Be $now.AddMinutes(-2)
+    }
+
+    It 'keeps inferring progress when the observed tail contains no task boundary' {
+        $path = Write-RolloutFixture -ThreadId '10000000-0000-0000-0000-000000000011' -Events @(
+            New-FixtureEvent -Timestamp $now.AddMinutes(-2) -TopType 'turn_context'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-1) -TopType 'event_msg' -PayloadType 'agent_reasoning'
+        )
+        $thread = Get-RolloutObservation -Path $path -Now $now
+        $thread = Set-ThreadHealthStatus -Thread $thread -Config $config -Now $now
+        $thread.Status | Should Be 'Healthy'
+        $thread.TaskStartedUtc | Should Be $now.AddMinutes(-2)
+    }
+
+    It 'does not infer a new task after an abort when its start is outside the observed tail' {
+        $path = Write-RolloutFixture -ThreadId '10000000-0000-0000-0000-000000000012' -Events @(
+            New-FixtureEvent -Timestamp $now.AddMinutes(-2) -TopType 'event_msg' -PayloadType 'turn_aborted'
+            New-FixtureEvent -Timestamp $now.AddMinutes(-1) -TopType 'event_msg' -PayloadType 'token_count'
+        )
+        $thread = Get-RolloutObservation -Path $path -Now $now
+        ($null -eq $thread) | Should Be $true
+    }
 }
 
 Describe 'Codex package process matching' {
@@ -2306,6 +2397,92 @@ CREATE TABLE logs (
         $remote = Get-RemoteTransportObservation -Config $config -DatabasePaths $databasePaths -Now $now
         $remote.ManualCondition | Should Be $false
         $remote.RepeatedFailure | Should Be $false
+    }
+
+    It 'does not mistake reconnect delays identifiers or URL digits for authentication codes' {
+        $timestamp = $now.AddMinutes(-1).ToUnixTimeSeconds()
+        $target = 'codex_app_server_transport::transport::remote_control::websocket'
+        $messages = @(
+            'status=Connecting reconnect_delay=401ms',
+            'status=Errored reconnect_delay=403ms',
+            'http reconnect_delay=409ms',
+            'status=Connecting connection_id=40100000-4030-4090-8000-000000000000',
+            'http reconnect url=https://relay.invalid/connections/401/403/409',
+            'http_status=4010',
+            'status: 1403',
+            'HTTP 4096'
+        )
+        foreach ($message in $messages) {
+            & sqlite3 $logDatabase "DELETE FROM logs; INSERT INTO logs VALUES ($timestamp, 'WARN', '$target', '$message');"
+            $LASTEXITCODE | Should Be 0
+            $remote = Get-RemoteTransportObservation -Config $config -DatabasePaths $databasePaths -Now $now
+            $remote.ManualCondition | Should Be $false
+            $remote.ManualReason | Should Be ''
+        }
+    }
+
+    It 'recognizes explicit bounded HTTP status authentication failures' {
+        $timestamp = $now.AddMinutes(-1).ToUnixTimeSeconds()
+        $target = 'codex_app_server_transport::transport::remote_control::websocket'
+        $cases = @(
+            @{ Message = 'http_status=401'; Reason = 'auth_401' },
+            @{ Message = 'status: 403'; Reason = 'auth_403' },
+            @{ Message = 'HTTP 409 Conflict'; Reason = 'auth_409' },
+            @{ Message = 'HTTP status 401 Unauthorized'; Reason = 'auth_401' },
+            @{ Message = 'Unauthorized'; Reason = 'auth_401' },
+            @{ Message = 'Forbidden'; Reason = 'auth_403' },
+            @{ Message = 'MFA required'; Reason = 'auth_mfa' }
+        )
+        foreach ($case in $cases) {
+            $message = $case.Message
+            & sqlite3 $logDatabase "DELETE FROM logs; INSERT INTO logs VALUES ($timestamp, 'WARN', '$target', '$message');"
+            $LASTEXITCODE | Should Be 0
+            $remote = Get-RemoteTransportObservation -Config $config -DatabasePaths $databasePaths -Now $now
+            $remote.ManualCondition | Should Be $true
+            $remote.ManualReason | Should Be $case.Reason
+        }
+    }
+
+    It 'does not count Connecting or Errored transport status as a successful connection' {
+        $first = $now.AddSeconds(-370).ToUnixTimeSeconds()
+        $second = $now.AddSeconds(-190).ToUnixTimeSeconds()
+        $third = $now.AddSeconds(-30).ToUnixTimeSeconds()
+        $latest = $now.AddSeconds(-10).ToUnixTimeSeconds()
+        $target = 'codex_app_server_transport::transport::remote_control::websocket'
+        foreach ($status in @('Connecting', 'Errored')) {
+            & sqlite3 $logDatabase "DELETE FROM logs; INSERT INTO logs VALUES ($first, 'WARN', '$target', 'connection failed'); INSERT INTO logs VALUES ($second, 'WARN', '$target', 'connection failed'); INSERT INTO logs VALUES ($third, 'WARN', '$target', 'connection failed'); INSERT INTO logs VALUES ($latest, 'INFO', '$target', 'Remote connection status changed status=$status');"
+            $LASTEXITCODE | Should Be 0
+            $remote = Get-RemoteTransportObservation -Config $config -DatabasePaths $databasePaths -Now $now
+            $remote.ManualCondition | Should Be $false
+            $remote.RepeatedFailure | Should Be $true
+            ($remote.FailureCount -ge 3) | Should Be $true
+        }
+    }
+
+    It 'clears an earlier transient authentication failure after a successful connection' {
+        $failure = $now.AddMinutes(-2).ToUnixTimeSeconds()
+        $success = $now.AddMinutes(-1).ToUnixTimeSeconds()
+        $target = 'codex_app_server_transport::transport::remote_control::websocket'
+        & sqlite3 $logDatabase "INSERT INTO logs VALUES ($failure, 'WARN', '$target', 'http_status=401 Unauthorized'); INSERT INTO logs VALUES ($success, 'INFO', '$target', 'connected');"
+        $LASTEXITCODE | Should Be 0
+        $remote = Get-RemoteTransportObservation -Config $config -DatabasePaths $databasePaths -Now $now
+        $remote.ManualCondition | Should Be $false
+        $remote.ManualReason | Should Be ''
+        $remote.RepeatedFailure | Should Be $false
+    }
+
+    It 'uses event order to clear transient auth only for a later same-second connection success' {
+        $timestamp = $now.AddMinutes(-1).ToUnixTimeSeconds()
+        $target = 'codex_app_server_transport::transport::remote_control::websocket'
+        & sqlite3 $logDatabase "INSERT INTO logs VALUES ($timestamp, 'WARN', '$target', 'http_status=401 Unauthorized'); INSERT INTO logs VALUES ($timestamp, 'INFO', '$target', 'connected');"
+        $LASTEXITCODE | Should Be 0
+        $remote = Get-RemoteTransportObservation -Config $config -DatabasePaths $databasePaths -Now $now
+        $remote.ManualCondition | Should Be $false
+        & sqlite3 $logDatabase "DELETE FROM logs; INSERT INTO logs VALUES ($timestamp, 'INFO', '$target', 'connected'); INSERT INTO logs VALUES ($timestamp, 'WARN', '$target', 'http_status=401 Unauthorized');"
+        $LASTEXITCODE | Should Be 0
+        $remote = Get-RemoteTransportObservation -Config $config -DatabasePaths $databasePaths -Now $now
+        $remote.ManualCondition | Should Be $true
+        $remote.ManualReason | Should Be 'auth_401'
     }
 
     It 'recognizes repeated Remote failures spanning five minutes' {
